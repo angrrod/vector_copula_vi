@@ -1,5 +1,6 @@
 from pyro.distributions.torch_distribution import TorchDistribution
 import torch
+from torch.distributions import constraints
 
 def Blockdiag(B,dimList):
     Bdiag = B.clone()
@@ -30,19 +31,19 @@ class VectorCopulaFlow(TorchDistribution):
         zeta    Scalar parameter
         """
         self.flows = flows
-        self.distribs = [flow() in flows]
+        self.distribs = [flow() for flow in flows]
         self.B      = B
         self.zeta   = zeta
-        self.blocksizes = [dist.event_shape for dist in distribs]
+        self.blocksizes = [dist.event_shape[0] for dist in self.distribs]
         self.N      = self.B.shape[0]
         self.device = B.device #TODO: Use this variable every time you create a tensor!
         batch_shape = torch.Size() #TODO: imlement batching support
         event_shape = torch.Size([self.B.shape[0]])
-        assert self.N == self.blocksizes.sum(), "Block sizes should add up to D"
+        assert self.N == torch.tensor(self.blocksizes, dtype=torch.int).sum(), "Block sizes should add up to D"
         super().__init__(batch_shape=batch_shape, event_shape=event_shape, validate_args=None)
 
     def log_prob(self, value: torch.Tensor) -> torch.Tensor:
-        value_split = torch.split(values, self.blocksizes)
+        value_split = torch.split(value, self.blocksizes)
         #Compute marginal contribution to logprob
         logp_marg = torch.zeros(len(self.distribs))
         Qlist = []
@@ -73,21 +74,21 @@ class VectorCopulaFlow(TorchDistribution):
     def Omega(self):
         OmegaTilde = self.zeta * torch.eye(self.N) + self.B @ self.B.T
 
-        if not torch.isfinite(OmegaBar).all():
+        if not torch.isfinite(OmegaTilde).all():
             raise RuntimeError("OmegaBar contains NaN/Inf")
         
-        Bd = Blockdiag(OmegaBar, self.blocksizes)
+        Bd = Blockdiag(OmegaTilde, self.blocksizes)
         #Bd = Bd + 1e-6 * eye #TODO: Se if it works without
         L = torch.linalg.cholesky(Bd)
 
         A = torch.inverse(L)
-        return A @ OmegaBar @ A.T
+        return A @ OmegaTilde @ A.T
 
     def rsample(self, sample_shape=torch.Size()):
         Omega = self.Omega()
         MultiNormal = torch.distributions.MultivariateNormal(loc=torch.zeros((self.N))
                                                     , covariance_matrix=Omega)
-        sample = dist.rsample(sample_shape)
+        sample = MultiNormal.rsample(sample_shape)
         Z = torch.split(sample, self.blocksizes, dim=-1) #TODO:Check this
         sample_list = []
         for i in range(len(self.distribs)):
