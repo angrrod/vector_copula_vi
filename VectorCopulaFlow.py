@@ -1,6 +1,7 @@
 from pyro.distributions.torch_distribution import TorchDistribution
 import torch
 from torch.distributions import constraints
+import torch.nn.functional as F
 
 def Blockdiag(B,dimList):
     Bdiag = B.clone()
@@ -14,7 +15,6 @@ def Blockdiag(B,dimList):
         
     return Bdiag
 
-
 class VectorCopulaFlow(TorchDistribution):
     """
     Implementation of the VectorCopula distribution with 
@@ -24,16 +24,16 @@ class VectorCopulaFlow(TorchDistribution):
     support         = constraints.real_vector
     has_rsample     = True  # set True if you implement rsample()
 
-    def __init__(self, flows:list, B:torch.Tensor, zeta:torch.Tensor):
+    def __init__(self, flows:list, B:torch.Tensor, z:torch.Tensor):
         """
         flow_n  Python list of Zuko flows modeling the margina
         B       D x P matrix, where P < D, and D is event_shape
-        zeta    Scalar parameter
+        z       Scalar parameter
         """
         self.flows = flows
         self.distribs = [flow() for flow in flows]
         self.B      = B
-        self.zeta   = zeta
+        self.z      = z #we take the softplus of this to obtain zeta to make it strictly positive
         self.blocksizes = [dist.event_shape[0] for dist in self.distribs]
         self.N      = self.B.shape[0]
         self.device = B.device #TODO: Use this variable every time you create a tensor!
@@ -72,13 +72,13 @@ class VectorCopulaFlow(TorchDistribution):
         return logDensity, logDetTerm, logCopulaTerm
 
     def Omega(self):
-        OmegaTilde = self.zeta * torch.eye(self.N) + self.B @ self.B.T
+        zeta = F.softplus(self.z)  #force zeta to be positive as it acts as regulartor fo positive definiteness
+        OmegaTilde = zeta * torch.eye(self.N) + self.B @ self.B.T
 
         if not torch.isfinite(OmegaTilde).all():
             raise RuntimeError("OmegaBar contains NaN/Inf")
         
         Bd = Blockdiag(OmegaTilde, self.blocksizes)
-        #Bd = Bd + 1e-6 * eye #TODO: Se if it works without
         L = torch.linalg.cholesky(Bd)
 
         A = torch.inverse(L)
