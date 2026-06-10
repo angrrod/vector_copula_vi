@@ -17,7 +17,8 @@ import pyro.distributions as dist
 from pyro.infer import SVI, Trace_ELBO
 from pyro.optim import Adam,ClippedAdam
 from pyro.optim import MultiStepLR
-
+import os
+import math
 class IdentityTransform:
     domain = constraints.real_vector
     codomain = constraints.real_vector
@@ -94,6 +95,47 @@ class IdentityFlow(nn.Module):
             dtype=dtype,
         )
 
+def cosine_cycle(step, cycle_length, min_factor=0.05, max_factor=1.0):
+    """
+    Periodic cosine multiplier.
+
+    Returns a factor between min_factor and max_factor.
+    max -> min -> max
+    """
+    phase = (step % cycle_length) / cycle_length
+
+    # 1 -> 0 -> 1 over one full cycle
+    cosine = 0.5 * (1.0 + math.cos(2.0 * math.pi * phase))
+
+    return min_factor + (max_factor - min_factor) * cosine
+
+def shifted_cosine_cycle(step, cycle_length, min_factor=0.05, max_factor=1.0):
+    """
+    Periodic cosine multiplier.
+
+    Returns a factor between min_factor and max_factor.
+    min -> max -> min
+    """
+    phase = (step % cycle_length) / cycle_length
+
+    # 0 -> 1 -> 0 over one full cycle
+    wave = 0.5 * (1.0 - math.cos(2.0 * math.pi * phase))
+    return min_factor + (max_factor - min_factor) * wave
+
+def optim_args(param_name):
+    if param_name == "B":
+        lr = 5e-2
+    elif param_name == "z":
+        lr = 5e-2
+    else:
+        lr = 1e-3
+
+    return {
+        "lr": lr,
+        "clip_norm": 10.0,
+        "lrd": 1.0,   # no internal monotone decay
+    }
+    
 class pyroImplementation:
     def __init__(self,trainData):
         self.priorVar  = 2.0
@@ -104,34 +146,16 @@ class pyroImplementation:
         self.flows     = nn.ModuleList(flows)
         self.trainData = trainData
         self.N, self.M, self.D = trainData.shape  # [N,M,D]
-        knownCov  = 100000*torch.tensor([ 
+        knownCov  = 1000*torch.tensor([ 
                 [1.0, 0.5, 0.1, 0.3],
                 [0.5, 1.0, 0.2, 0.05],
                 [0.1, 0.2, 1.0, 0.45],
                 [0.3, 0.05, 0.45, 1.0],
             ]) #[B,B]
         self.knownCov = knownCov.expand(1,self.D,self.D)
-        self.loss   = Trace_ELBO(num_particles=10) #
+        self.loss   = Trace_ELBO(num_particles=2) #
 
         #optimizer args
-        final_fraction = 0.01
-        num_steps = 1000
-        lrd = final_fraction ** (1.0 / num_steps)
-
-        def optim_args(param_name):
-            if param_name == "B":
-                lr = 1e-3
-            elif param_name == "z":
-                lr = 1e-3
-            else:
-                lr = 1e-4
-
-            return {
-                "lr": lr,
-                "clip_norm": 10.0,
-                "lrd": lrd, #learning decay
-            }
-        
         self.optimizer = ClippedAdam(optim_args) 
         
     def model(self,data):
@@ -178,6 +202,7 @@ class pyroImplementation:
         loss_list   = []
         svi         = SVI(self.model, self.guide,  self.optimizer, loss=self.loss)
         component_history = {
+            "step": [],
             "q_total": [],
             "q_marginal_total": [],
             "q_copula_total": [],
@@ -188,15 +213,30 @@ class pyroImplementation:
         for i in range(len(self.flows)):
             component_history[f"q_marginal_{i}"] = []
             
-        for _ in tqdm(range(n_steps)):
+        #component logging, for debugging
+        diag_every = 1
+        n_diag_samples = 1025
+        n_plots = 40
+        for step in tqdm(range(n_steps)):
             loss = svi.step(self.trainData)
+            
+            self.update_learning_rates(step + 1)
+            
             loss_list.append(loss)
             
-            diagnostics = self.compute_q_log_prob_diagnostics(
-                value = self.trainData
-            )       
-            for key, value in diagnostics.items():
-                component_history[key].append(value)     
+            if step % diag_every == 0:
+                diagnostics = self.compute_q_log_prob_diagnostics(
+                    n_diag_samples=n_diag_samples
+                )
+
+                component_history["step"].append(step)
+
+                for key, value in diagnostics.items():
+                    component_history[key].append(value)   
+            if step % (n_steps//n_plots) == 0:
+                q = self.get_trained_variational_model(detach=False)
+                plot_each_marginal_flow_output(q,suffix= f'_{step}')
+                    
 
         return loss_list, component_history
     
@@ -226,7 +266,7 @@ class pyroImplementation:
         dist = torch.distributions.MultivariateNormal(mu_post, covariance_matrix=Sigma_post)
         return dist.sample((N,)),Sigma_post,mu_post
     
-    def compute_q_log_prob_diagnostics(self, value: torch.Tensor):
+    def compute_q_log_prob_diagnostics(self, n_diag_samples: torch.Tensor = 512):
         """
         Compute diagnostic components of log q(value).
         value: torch.Tensor -> 
@@ -238,7 +278,8 @@ class pyroImplementation:
         q = self.get_trained_variational_model(detach=False)
 
         with torch.no_grad():
-            components = q.log_prob_components(value)
+            theta_diag = q.rsample((n_diag_samples,))
+            components = q.log_prob_components(theta_diag)
 
             diagnostics = {
                 "q_total": components["log_prob_total"].mean().detach().cpu().item(),
@@ -253,6 +294,50 @@ class pyroImplementation:
 
         return diagnostics
     
+    def get_lr_for_param(self, param_name, step):
+        if param_name == "B":
+            base_lr = 1e-2
+            factor = cosine_cycle(
+                step,
+                cycle_length=200,
+                min_factor=0.1,
+                max_factor=1.0,
+            )
+
+        elif param_name == "z":
+            base_lr = 1e-2
+            factor = cosine_cycle(
+                step,
+                cycle_length=200,
+                min_factor=0.1,
+                max_factor=1.0,
+            )
+
+        else:
+            base_lr = 5e-4
+            factor = shifted_cosine_cycle(
+                step,
+                cycle_length=1000,
+                min_factor=0.01,
+                max_factor=1.0,
+            )
+
+        return base_lr * factor
+
+    def update_learning_rates(self, step):
+        param_store = pyro.get_param_store()
+
+        for param, torch_optimizer in self.optimizer.optim_objs.items():
+            param_name = param_store._param_to_name.get(param, None)
+
+            if param_name is None:
+                continue
+
+            lr = self.get_lr_for_param(param_name, step)
+
+            for group in torch_optimizer.param_groups:
+                group["lr"] = lr
+
 def count_trainable_params(model):
     flow_params = [
         p
@@ -271,26 +356,27 @@ def count_trainable_params(model):
 def getInitModelParams():
     flow_1 = zuko.flows.NSF(
         features=2,
-        transforms=8,
+        transforms=4,
         context=0,
-        hidden_features=(64, 64),
-        bins=32,
+        hidden_features=(8, 8),
+        bins=8,
         randperm=True,
     )
+    
     flow_2 = zuko.flows.NSF(
         features=2,
-        transforms=8,
+        transforms=4,
         context=0,
-        hidden_features=(64, 64),
-        bins=32,
-        randperm=True,
+        hidden_features=(8, 8),
+        bins=8,
+        randperm=False,
     )
     
     # flow_1 = IdentityFlow(features=2)
     # flow_2 = IdentityFlow(features=2)
     flows = [flow_1,flow_2]
-    B     = torch.nn.Parameter(torch.randn(1, 4, 3) * 2.0)
-    z     = torch.nn.Parameter(torch.tensor([-3.0]))
+    B     = torch.nn.Parameter(torch.randn(1, 4, 3) * 4.0)
+    z     = torch.nn.Parameter(torch.tensor([3.0]))
     return flows,B,z
 
 def buildModel():
@@ -314,7 +400,7 @@ def train(model_to_train,num_epochs,X):
     dataset = TensorDataset(X)
     dataloader = DataLoader(
         dataset,
-        batch_size = 10000, #2048
+        batch_size = 50000, #2048
         shuffle    = False,  #True
         drop_last  = False,
     )
@@ -326,7 +412,7 @@ def train(model_to_train,num_epochs,X):
     optimizerArgs = [
         {
             "params": flow_params,
-            "lr": 1e-4,
+            "lr": 1e-3,
         },
         {
             "params": [model_to_train.B],
@@ -620,7 +706,7 @@ def make_corner_plot_two_clouds(
 
     return fig
 
-def movingAverageLosses(losses,suffix,window = 10):
+def movingAverageLosses(losses,suffix,window = 50):
     def moving_average(x, window=200):
         x = np.asarray(x)
         return np.convolve(x, np.ones(window) / window, mode="valid")
@@ -645,8 +731,9 @@ def plot_q_log_prob_components(component_history, suffix="_pyro"):
 
     plt.plot(
         component_history["q_total"],
-        label="E_q[log q(theta)]",
+        label="q_total",
         linewidth=1.2,
+        linestyle="dashed"
     )
 
     plt.plot(
@@ -654,6 +741,7 @@ def plot_q_log_prob_components(component_history, suffix="_pyro"):
         label="Marginal contribution",
         linewidth=1.0,
         alpha=0.8,
+        linestyle="dashdot"
     )
 
     plt.plot(
@@ -661,6 +749,7 @@ def plot_q_log_prob_components(component_history, suffix="_pyro"):
         label="Copula contribution",
         linewidth=1.0,
         alpha=0.8,
+        linestyle="dotted"
     )
 
     plt.plot(
@@ -668,6 +757,7 @@ def plot_q_log_prob_components(component_history, suffix="_pyro"):
         label="Copula log-det term",
         linewidth=1.0,
         alpha=0.8,
+        linestyle="dashdot"
     )
 
     plt.plot(
@@ -675,6 +765,7 @@ def plot_q_log_prob_components(component_history, suffix="_pyro"):
         label="Copula quadratic term",
         linewidth=1.0,
         alpha=0.8,
+        linestyle="dashdot"
     )
 
     for key, values in component_history.items():
@@ -683,7 +774,8 @@ def plot_q_log_prob_components(component_history, suffix="_pyro"):
                 values,
                 label=key,
                 linewidth=0.8,
-                alpha=0.6,
+                alpha=0.8,
+                linestyle="dotted"
             )
 
     plt.xlabel("SVI step")
@@ -700,17 +792,122 @@ def plot_q_log_prob_components(component_history, suffix="_pyro"):
     plt.savefig(filename, dpi=300, bbox_inches="tight")
     plt.close()
 
+def plot_each_marginal_flow_output(
+    q,
+    N=10_000,
+    out_dir="vector_copula_vi_v2/vector_copula_vi/Plots/Marginals",
+    suffix="",
+):
+    """
+    For each Zuko marginal flow in q.flows:
+
+        z ~ N(0, I_d)
+        x = flow.transform(z)
+
+    Then creates a corner plot of x.
+
+    Args:
+        q:
+            VectorCopulaFlow_V2 object.
+        N:
+            Number of base samples per marginal flow.
+        out_dir:
+            Directory where plots are saved.
+        suffix:
+            Optional suffix for filenames.
+
+    Returns:
+        list[str]: saved plot filenames.
+    """
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    filenames = []
+
+    device = q.B.device
+    dtype = q.B.dtype
+
+    for flow_idx, flow in enumerate(q.flows):
+        # Construct the Zuko distribution object.
+        flow_dist = flow()
+
+        # Input/event dimension of this marginal flow.
+        d = flow_dist.event_shape[0]
+
+        with torch.no_grad():
+            # Base samples: z ~ N(0, I_d)
+            z = torch.randn(
+                N,
+                d,
+                device=device,
+                dtype=dtype,
+            )
+
+            # Push through the flow: x = T(z)
+            x = flow_dist.transform(z)
+
+        x_np = x.detach().cpu().numpy()
+
+        labels = [rf"$x_{{{j+1}}}$" for j in range(d)]
+
+        filename = os.path.join(
+            out_dir,
+            f"flow_{flow_idx}_output_corner{suffix}.png",
+        )
+
+        if d == 1:
+            # corner is overkill for 1D and sometimes awkward.
+            plt.figure(figsize=(6, 4))
+            plt.hist(x_np[:, 0], bins=80, density=True, alpha=0.75)
+            plt.xlabel(labels[0])
+            plt.ylabel("Density")
+            plt.title(f"Output distribution of flow {flow_idx}")
+            plt.grid(True, alpha=0.3)
+            plt.savefig(filename, dpi=300, bbox_inches="tight")
+            plt.close()
+
+        else:
+            fig = corner.corner(
+                x_np,
+                labels=labels,
+                bins=50,
+                show_titles=True,
+                title_fmt=".3f",
+                plot_datapoints=True,
+                plot_density=False,
+                plot_contours=True,
+                fill_contours=False,
+            )
+
+            fig.suptitle(
+                f"Output distribution of marginal flow {flow_idx}",
+                fontsize=16,
+            )
+
+            fig.tight_layout()
+            fig.savefig(filename, dpi=300, bbox_inches="tight")
+            plt.close(fig)
+
+        filenames.append(filename)
+
+    return filenames
+
 if __name__ == "__main__":
-    N                    = [500000]
+    N                    = [10000]
     # model_base           = buildModel()
     # X                    = model_base.sample(N)
     X,_,_                = SampleMLGaussianModel(N)
     X_base               = X.unsqueeze(1)
     model_to_train       = buildModel()
-    N_samples_plot       = 100000
-    n_epochs             = 2000  #10000
+    N_samples_plot       = 10000
+    n_epochs             = 5000  #10000
     
-    suffix = "_pyro_v5"
+    #classic ML
+    # losses, batch_losses, dataloader = train(model_to_train,600,X)
+    # plot_losses(losses, batch_losses, dataloader)
+    
+    #Bayesian
+    suffix = "_pyro_v6"
     
     impl = pyroImplementation(X_base)
     losses, component_history = impl.train(n_epochs)
@@ -721,7 +918,6 @@ if __name__ == "__main__":
     make_corner_plot_two_clouds(Trained_model.sample([N_samples_plot]),Sample,suffix = suffix)
     plot_q_log_prob_components(component_history, suffix=suffix)
     movingAverageLosses(losses,suffix)
-
     _, mean_train, cov_train,  = empirical_covariance(Trained_model, n_samples=N_samples_plot)
     print(f'cov_base: {cov_base}')
     print(f'cov_train: {cov_train}')

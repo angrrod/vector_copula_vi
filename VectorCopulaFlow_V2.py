@@ -173,7 +173,7 @@ class VectorCopulaFlow_V2(TorchDistribution):
         Q = torch.cat(Qlist, dim=-1)                               # [S, M, D]
         #Compute copula contribution to logprob
         log_copula_total,log_det_term, log_copula_quad  = self._logProbCopula(Q) #[S, self.M]
-        out = log_copula_total + log_copula_total
+        out = log_copula_total + logp_marg_total
 
         
         components = {
