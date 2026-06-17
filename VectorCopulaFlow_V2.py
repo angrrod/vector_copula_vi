@@ -74,7 +74,39 @@ def WoodburyComponents(z: torch.Tensor,B: torch.Tensor) -> torch.Tensor:
     Woodbury = (I_d_batch - B @ Kinv_Bt)/zeta_b  #[M,D,D]
     return Woodbury, zeta, L_K  #return zeta, L_K for speed to do the calculation onely once
 
-class VectorCopulaFlow_V2(TorchDistribution): 
+#tests
+def _assert_finite_tensor(name: str, x: torch.Tensor):
+    if not torch.is_tensor(x):
+        raise TypeError(f"{name} must be a torch.Tensor, got {type(x)}")
+
+    if not torch.isfinite(x).all():
+        finite = torch.isfinite(x)
+
+        if finite.any():
+            finite_vals = x[finite]
+            min_val = finite_vals.min().item()
+            max_val = finite_vals.max().item()
+        else:
+            min_val = "no finite values"
+            max_val = "no finite values"
+
+        raise ValueError(
+            f"{name} contains NaN or Inf. "
+            f"shape={tuple(x.shape)}, "
+            f"dtype={x.dtype}, "
+            f"device={x.device}, "
+            f"finite_min={min_val}, "
+            f"finite_max={max_val}"
+        )
+        
+def _assert_finite_module_parameters(name: str, module: torch.nn.Module):
+    for param_name, param in module.named_parameters():
+        _assert_finite_tensor(f"{name}.{param_name}", param)
+
+    for buffer_name, buffer in module.named_buffers():
+        _assert_finite_tensor(f"{name}.{buffer_name}", buffer)
+
+class VectorCopulaFlow(TorchDistribution): 
     """
     Implementation of the VectorCopula distribution with 
     Zuko normalizing flows as marginals
@@ -89,6 +121,19 @@ class VectorCopulaFlow_V2(TorchDistribution):
         B       M x D x P matrix, where P < D, D is event_shape and M is the batch shape denoting different distributions, used in amortization
         z       M vector parameter
         """
+        
+        #test finitness of the input parameters
+        _assert_finite_tensor("B", B)
+        _assert_finite_tensor("z", z)
+
+        for i, flow in enumerate(flows):
+            if not isinstance(flow, torch.nn.Module):
+                raise TypeError(
+                    f"flows[{i}] must be a torch.nn.Module, got {type(flow)}"
+                )
+
+            _assert_finite_module_parameters(f"flows[{i}]", flow)
+        
         self.flows = flows
         self.distribs = [flow() for flow in flows]
         self.B      = B
@@ -167,7 +212,7 @@ class VectorCopulaFlow_V2(TorchDistribution):
         Qlist = []
         for dist, value_i in zip(self.distribs, value_split):
             logp_marg_list.append(dist.log_prob(value_i))      # [S, M]
-            Qlist.append(dist.transform.inv(value_i))          # [S, M, d_i]
+            Qlist.append(dist.transform(value_i))          # [S, M, d_i]
             
         logp_marg_total = torch.stack(logp_marg_list, dim=0).sum(dim=0)  # [S, M]
         Q = torch.cat(Qlist, dim=-1)                               # [S, M, D]
@@ -299,7 +344,7 @@ class VectorCopulaFlow_V2(TorchDistribution):
         Z = torch.split(sample, self.blocksizes, dim=-1)
         sample_list = []
         for dist, Z_i in zip(self.distribs, Z):  #use zip because split creates a list.
-            sample_i = dist.transform(Z_i)
+            sample_i = dist.transform.inv(Z_i)
             sample_list.append(sample_i)
         return torch.cat(sample_list, dim=-1) #[sample_shape, self.M, self.D]
     
@@ -307,3 +352,62 @@ class VectorCopulaFlow_V2(TorchDistribution):
         with torch.no_grad():
             return self.rsample(sample_shape)#[sample_shape, self.M, self.D]
     
+    def state_dict(self) -> dict:
+        """
+        Return a serializable state dict for warm-starting this distribution.
+
+        Includes:
+        - all Zuko flow parameters
+        - B
+        - z
+        """
+
+        return {
+            "flows": [flow.state_dict() for flow in self.flows],
+            "B": self.B.detach().clone(),
+            "z": self.z.detach().clone(),
+            "blocksizes": list(self.blocksizes),
+            "D": self.D,
+            "P": self.P,
+            "M": self.M,
+        }
+
+    def load_state_dict(self, state: dict, strict: bool = True):
+        """
+        Load a state dict produced by self.state_dict().
+
+        Assumes that the current object was already initialized with the same
+        number of flows and compatible B/z shapes.
+        """
+
+        if strict:
+            if len(state["flows"]) != len(self.flows):
+                raise ValueError(
+                    f"Number of flows does not match: "
+                    f"state has {len(state['flows'])}, model has {len(self.flows)}"
+                )
+
+            if tuple(state["B"].shape) != tuple(self.B.shape):
+                raise ValueError(
+                    f"B shape mismatch: "
+                    f"state has {tuple(state['B'].shape)}, model has {tuple(self.B.shape)}"
+                )
+
+            if tuple(state["z"].shape) != tuple(self.z.shape):
+                raise ValueError(
+                    f"z shape mismatch: "
+                    f"state has {tuple(state['z'].shape)}, model has {tuple(self.z.shape)}"
+                )
+
+            if list(state["blocksizes"]) != list(self.blocksizes):
+                raise ValueError(
+                    f"Blocksize mismatch: "
+                    f"state has {state['blocksizes']}, model has {self.blocksizes}"
+                )
+
+        for flow, flow_state in zip(self.flows, state["flows"]):
+            flow.load_state_dict(flow_state, strict=strict)
+
+        with torch.no_grad():
+            self.B.copy_(state["B"].to(device=self.B.device, dtype=self.B.dtype))
+            self.z.copy_(state["z"].to(device=self.z.device, dtype=self.z.dtype))

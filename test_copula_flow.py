@@ -19,6 +19,9 @@ from pyro.optim import Adam,ClippedAdam
 from pyro.optim import MultiStepLR
 import os
 import math
+import torch.nn.functional as F
+from tqdm import trange
+
 class IdentityTransform:
     domain = constraints.real_vector
     codomain = constraints.real_vector
@@ -39,7 +42,6 @@ class IdentityTransform:
             device=x.device,
             dtype=x.dtype,
         )
-
 class IdentityFlowDistribution:
     arg_constraints = {}
     support = constraints.real_vector
@@ -74,7 +76,6 @@ class IdentityFlowDistribution:
 
         z = self.base.rsample(sample_shape)
         return self.transform(z)
-
 class IdentityFlow(nn.Module):
     def __init__(self, features: int):
         super().__init__()
@@ -94,6 +95,33 @@ class IdentityFlow(nn.Module):
             device=device,
             dtype=dtype,
         )
+
+def known_cov_for_target_posterior_corr(R, N=10_000, priorVar=2.0):
+    """
+    Construct knownCov such that Sigma_post == R.
+
+    R must be a positive definite correlation matrix.
+    """
+    d = R.shape[0]
+    device = R.device
+    dtype = R.dtype
+
+    I = torch.eye(d, device=device, dtype=dtype)
+    prior_precision = 1.0 / priorVar**2
+
+    A = torch.linalg.inv(R) - prior_precision * I
+
+    # Must be positive definite, otherwise knownCov is invalid
+    eigvals = torch.linalg.eigvalsh(A)
+    if torch.any(eigvals <= 0):
+        raise ValueError(
+            f"Invalid target R for priorVar={priorVar}. "
+            f"Need inv(R) - prior_precision * I positive definite. "
+            f"Smallest eigenvalue: {eigvals.min().item()}"
+        )
+
+    knownCov = N * torch.linalg.inv(A)
+    return knownCov
 
 def cosine_cycle(step, cycle_length, min_factor=0.05, max_factor=1.0):
     """
@@ -135,9 +163,38 @@ def optim_args(param_name):
         "clip_norm": 10.0,
         "lrd": 1.0,   # no internal monotone decay
     }
-    
+
+def get_lr_for_param(param_name, step):
+    if param_name == "B":
+        base_lr = 1e-3
+        factor = cosine_cycle(
+            step,
+            cycle_length=500,
+            min_factor=0.05,
+            max_factor=1.0,
+        )
+
+    elif param_name == "z":
+        base_lr = 1e-3
+        factor = cosine_cycle(
+            step,
+            cycle_length=500,
+            min_factor=0.05,
+            max_factor=1.0,
+        )
+
+    else:
+        base_lr = 1e-3
+        factor = shifted_cosine_cycle(
+            step,
+            cycle_length=500,
+            min_factor=0.05,
+            max_factor=1.0,
+        )
+
+    return base_lr * factor
 class pyroImplementation:
-    def __init__(self,trainData):
+    def __init__(self,trainData,knownCov):
         self.priorVar  = 2.0
 
         flows,B,z      = getInitModelParams()
@@ -146,14 +203,23 @@ class pyroImplementation:
         self.flows     = nn.ModuleList(flows)
         self.trainData = trainData
         self.N, self.M, self.D = trainData.shape  # [N,M,D]
-        knownCov  = 1000*torch.tensor([ 
-                [1.0, 0.5, 0.1, 0.3],
-                [0.5, 1.0, 0.2, 0.05],
-                [0.1, 0.2, 1.0, 0.45],
-                [0.3, 0.05, 0.45, 1.0],
-            ]) #[B,B]
+        
+        # d = 4
+        # N = 2000
+        # priorVar = 2.0
+        # rho = 0.5
+
+        # R = torch.full((d, d), rho)
+        # R.fill_diagonal_(1.0)
+
+        # knownCov = known_cov_for_target_posterior_corr(
+        #     R,
+        #     N=N,
+        #     priorVar=priorVar,
+        # )
+        
         self.knownCov = knownCov.expand(1,self.D,self.D)
-        self.loss   = Trace_ELBO(num_particles=2) #
+        self.loss   = Trace_ELBO(num_particles=5) #
 
         #optimizer args
         self.optimizer = ClippedAdam(optim_args) 
@@ -216,7 +282,7 @@ class pyroImplementation:
         #component logging, for debugging
         diag_every = 1
         n_diag_samples = 1025
-        n_plots = 40
+        n_plots = 1
         for step in tqdm(range(n_steps)):
             loss = svi.step(self.trainData)
             
@@ -293,36 +359,6 @@ class pyroImplementation:
                 diagnostics[f"q_marginal_{i}"] = logp_i.mean().detach().cpu().item()
 
         return diagnostics
-    
-    def get_lr_for_param(self, param_name, step):
-        if param_name == "B":
-            base_lr = 1e-2
-            factor = cosine_cycle(
-                step,
-                cycle_length=200,
-                min_factor=0.1,
-                max_factor=1.0,
-            )
-
-        elif param_name == "z":
-            base_lr = 1e-2
-            factor = cosine_cycle(
-                step,
-                cycle_length=200,
-                min_factor=0.1,
-                max_factor=1.0,
-            )
-
-        else:
-            base_lr = 5e-4
-            factor = shifted_cosine_cycle(
-                step,
-                cycle_length=1000,
-                min_factor=0.01,
-                max_factor=1.0,
-            )
-
-        return base_lr * factor
 
     def update_learning_rates(self, step):
         param_store = pyro.get_param_store()
@@ -333,10 +369,98 @@ class pyroImplementation:
             if param_name is None:
                 continue
 
-            lr = self.get_lr_for_param(param_name, step)
+            lr = get_lr_for_param(param_name, step)
 
             for group in torch_optimizer.param_groups:
                 group["lr"] = lr
+
+
+#ML code + general functions
+def split_X_into_blocks(X, block_sizes):
+    """
+    Split X along the final dimension.
+
+    Accepts X with shape:
+        [N, D]
+        [N, 1, D]
+        [N, M, D]
+
+    Returns:
+        list of tensors, each with shape [N*, block_size]
+    """
+
+    X = X.detach()
+
+    if X.ndim == 3:
+        # For your common case [N, 1, D], this becomes [N, D].
+        # For [N, M, D], this becomes [N*M, D].
+        N, M, D = X.shape
+        X = X.reshape(N * M, D)
+
+    elif X.ndim == 2:
+        pass
+
+    else:
+        raise ValueError(f"Expected X shape [N, D] or [N, M, D], got {tuple(X.shape)}")
+
+    if sum(block_sizes) != X.shape[-1]:
+        raise ValueError(
+            f"sum(block_sizes)={sum(block_sizes)} does not match X.shape[-1]={X.shape[-1]}"
+        )
+
+    return list(torch.split(X, block_sizes, dim=-1))
+
+def compute_log_prob_diagnostics_from_model(
+    model,
+    value=None,
+    n_diag_samples=512,
+    use_samples=False,
+):
+    """
+    Compute diagnostic components of log_prob for a VectorCopulaFlow_V2 model.
+
+    Parameters
+    ----------
+    model:
+        VectorCopulaFlow_V2 instance.
+
+    value:
+        Tensor used for diagnostics. Usually training data X.
+        Required if use_samples=False.
+
+    n_diag_samples:
+        Number of samples to draw if use_samples=True.
+
+    use_samples:
+        If False, compute diagnostics on provided value.
+        If True, sample from model and compute diagnostics on model samples.
+
+    Returns
+    -------
+    diagnostics : dict[str, float]
+    """
+
+    with torch.no_grad():
+        if use_samples:
+            value = model.rsample((n_diag_samples,))
+        else:
+            if value is None:
+                raise ValueError("value must be provided when use_samples=False")
+
+        components = model.log_prob_components(value)
+
+        diagnostics = {
+            "q_total": components["log_prob_total"].mean().detach().cpu().item(),
+            "q_marginal_total": components["logp_marg_total"].mean().detach().cpu().item(),
+            "q_copula_total": components["log_copula_total"].mean().detach().cpu().item(),
+            "q_log_det": components["log_det_term"].mean().detach().cpu().item(),
+            "q_copula_quad": components["log_copula_quad"].mean().detach().cpu().item(),
+        }
+
+        for i, logp_i in enumerate(components["logp_marginals"]):
+            diagnostics[f"q_marginal_{i}"] = logp_i.mean().detach().cpu().item()
+
+    return diagnostics
 
 def count_trainable_params(model):
     flow_params = [
@@ -353,30 +477,44 @@ def count_trainable_params(model):
     total = sum(p.numel() for p in flow_params + extra_params)
     return total
 
-def getInitModelParams():
+def getInitModelParams(TrainIdentity = False):
     flow_1 = zuko.flows.NSF(
         features=2,
-        transforms=4,
+        transforms=6,
         context=0,
         hidden_features=(8, 8),
-        bins=8,
+        bins=32,
         randperm=True,
     )
     
     flow_2 = zuko.flows.NSF(
         features=2,
-        transforms=4,
+        transforms=6,
         context=0,
         hidden_features=(8, 8),
-        bins=8,
+        bins=32,
         randperm=False,
     )
     
+    # TrainIdentity = True
+    if TrainIdentity:
+        history = train_flows_to_identity(
+            flows=[flow_1, flow_2],
+            steps=5000,
+            batch_size=4096,
+            lr=5e-3,
+            device="cpu",
+            sample_scale=1.0,
+        )
+        check_identity(flow_1)
+        
+        flow_1.load_state_dict(torch.load("/root/phd/GW_seperation_analysis/vector_copula_vi_v2/vector_copula_vi/Data/flow_1_identity.pt"))
     # flow_1 = IdentityFlow(features=2)
     # flow_2 = IdentityFlow(features=2)
+    flow_2.load_state_dict(flow_1.state_dict())  #break symmetry
     flows = [flow_1,flow_2]
-    B     = torch.nn.Parameter(torch.randn(1, 4, 3) * 4.0)
-    z     = torch.nn.Parameter(torch.tensor([3.0]))
+    B     = torch.nn.Parameter(torch.randn(1, 4, 3) * 0.5)
+    z     = torch.nn.Parameter(torch.tensor([1.0]))
     return flows,B,z
 
 def buildModel():
@@ -390,86 +528,365 @@ def buildModel():
     print(f"amount of trainable params: {count_trainable_params(model)}")
     return model
 
-def train(model_to_train,num_epochs,X):
+@torch.no_grad()
+def check_identity(flow, n=10_000, device="cpu"):
+    x = torch.randn(n, 2, device=device)
+
+    dist = flow()
+    transform = dist.transform
+
+    y = transform(x)
+    log_det = transform.log_abs_det_jacobian(x, y)
+
+    print("MSE(T(x), x):", F.mse_loss(y, x).item())
+    print("mean |T(x)-x|:", (y - x).abs().mean().item())
+    print("max  |T(x)-x|:", (y - x).abs().max().item())
+    print("mean log det:", log_det.mean().item())
+    print("std  log det:", log_det.std().item())
+    
+def identity_loss_for_flow(flow, x):
+    """
+    Train the Zuko flow transform to behave like identity:
+        T(x) ≈ x
+        log |det J_T(x)| ≈ 0
+    """
+
+    # For unconditional flows with context=0, flow() should instantiate the distribution.
+    dist = flow()
+
+    # Zuko distributions expose the underlying transform.
+    transform = dist.transform
+
+    y = transform(x)
+
+    # log_abs_det_jacobian usually returns shape [batch]
+    log_det = transform.log_abs_det_jacobian(x, y)
+
+    reconstruction_loss = F.mse_loss(y, x)
+    volume_loss = (log_det ** 2).mean()
+
+    return reconstruction_loss + 0.01 * volume_loss, {
+        "reconstruction": reconstruction_loss.detach(),
+        "volume": volume_loss.detach(),
+    }
+
+def train_flows_to_identity(
+    flows,
+    steps=10_000,
+    batch_size=4096,
+    lr=1e-3,
+    device="cpu",
+    dtype=torch.float32,
+    sample_scale=1.0,
+):
+    """
+    flows: list of Zuko flow modules, e.g. [flow_1, flow_2]
+    """
+
+    flow = flows[0]
+    flow.to(device=device, dtype=dtype)
+
+    params = [
+        p
+        for p in flow.parameters()
+        if p.requires_grad
+    ]
+
+    optimizer = torch.optim.Adam(params, lr=lr)
+
+    history = {
+        "loss": [],
+        "reconstruction": [],
+        "volume": [],
+    }
+
+    for step in trange(steps):
+        x = sample_scale * torch.randn(
+            batch_size, 2,
+            device=device,
+            dtype=dtype,
+        )
+
+        optimizer.zero_grad()
+
+        total_loss = 0.0
+        total_reconstruction = 0.0
+        total_volume = 0.0
+
+        loss, components = identity_loss_for_flow(flow, x)
+        total_loss = total_loss + loss
+        total_reconstruction = total_reconstruction + components["reconstruction"]
+        total_volume = total_volume + components["volume"]
+
+        total_loss.backward()
+        optimizer.step()
+
+        history["loss"].append(total_loss.item())
+        history["reconstruction"].append(total_reconstruction.item())
+        history["volume"].append(total_volume.item())
+    torch.save(flow.state_dict(), "/root/phd/GW_seperation_analysis/vector_copula_vi_v2/vector_copula_vi/Data/flow_1_identity.pt")
+    return history
+
+#generate flexible learning rates for ML optimization
+def update_learning_rates_pytorch(optimizer, get_lr_for_group, step):
+    for group in optimizer.param_groups:
+        group_name = group.get("name", None)
+
+        if group_name is None:
+            raise ValueError("Every optimizer param_group should have a 'name' field.")
+
+        group["lr"] = get_lr_for_group(group_name, step)
+
+def pretrain_marginal_flows(
+    flows,
+    X,
+    block_sizes=None,
+    n_epochs=1000,
+    batch_size=512,
+    lr=1e-3,
+    clip_norm=10.0,
+    shuffle=True,
+):
+    """
+    Pretrain each marginal Zuko flow by maximum likelihood on its corresponding data block.
+
+    Parameters
+    ----------
+    flows:
+        list or nn.ModuleList of Zuko flow modules.
+
+    X:
+        Training data, shape [N, D] or [N, M, D].
+
+    block_sizes:
+        List of event dimensions per marginal flow.
+        For two 2D marginal flows and 4D data: [2, 2].
+
+    n_epochs:
+        Number of pretraining epochs.
+
+    batch_size:
+        Minibatch size.
+
+    lr:
+        Learning rate for marginal-flow pretraining.
+
+    clip_norm:
+        Gradient clipping norm.
+
+    Returns
+    -------
+    history:
+        dict with one loss curve per marginal flow and a total loss curve.
+    """
+
+    if block_sizes is None:
+        block_sizes = [flow().event_shape[0] for flow in flows]
+
+    device = next(flows[0].parameters()).device
+    dtype = next(flows[0].parameters()).dtype
+
+    X = X.to(device=device, dtype=dtype)
+    X_blocks = split_X_into_blocks(X, block_sizes)
+
+    # Sanity check: each block dimension should match each flow dimension.
+    for i, (flow, X_block) in enumerate(zip(flows, X_blocks)):
+        flow_dim = flow().event_shape[0]
+        if X_block.shape[-1] != flow_dim:
+            raise ValueError(
+                f"Flow {i} has event dimension {flow_dim}, "
+                f"but its data block has dimension {X_block.shape[-1]}"
+            )
+
+    params = [
+        p
+        for flow in flows
+        for p in flow.parameters()
+        if p.requires_grad
+    ]
+
+    optimizer = torch.optim.Adam(params, lr=lr)
+
+    datasets = [
+        TensorDataset(X_block)
+        for X_block in X_blocks
+    ]
+
+    dataloaders = [
+        DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            drop_last=False,
+        )
+        for dataset in datasets
+    ]
+
+    history = {
+        "total": [],
+    }
+
+    for i in range(len(flows)):
+        history[f"flow_{i}"] = []
+
+    for epoch in tqdm(range(n_epochs)):
+        epoch_total_loss = 0.0
+        epoch_flow_losses = [0.0 for _ in flows]
+        n_seen_total = 0
+        n_seen_flow = [0 for _ in flows]
+
+        # This assumes all blocks have the same number of rows, which they should.
+        for batches in zip(*dataloaders):
+            optimizer.zero_grad(set_to_none=True)
+
+            total_loss = 0.0
+
+            for i, (flow, batch_tuple) in enumerate(zip(flows, batches)):
+                X_batch = batch_tuple[0]
+
+                flow_dist = flow()
+                log_prob = flow_dist.log_prob(X_batch)
+
+                loss_i = -log_prob.mean()
+                total_loss = total_loss + loss_i
+
+                batch_n = X_batch.shape[0]
+                epoch_flow_losses[i] += loss_i.detach().cpu().item() * batch_n
+                n_seen_flow[i] += batch_n
+
+            total_loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(
+                params,
+                max_norm=clip_norm,
+            )
+
+            optimizer.step()
+
+            batch_n = batches[0][0].shape[0]
+            epoch_total_loss += total_loss.detach().cpu().item() * batch_n
+            n_seen_total += batch_n
+
+        history["total"].append(epoch_total_loss / n_seen_total)
+
+        for i in range(len(flows)):
+            history[f"flow_{i}"].append(epoch_flow_losses[i] / n_seen_flow[i])
+
+    return history
+
+def train(model_to_train,num_epochs,
+        X,
+        batch_size = 50000, 
+        # lr_flows=1e-3,
+        # lr_B=5e-2,
+        # lr_z=5e-2
+    ):
     
     device = model_to_train.B.device
     dtype = model_to_train.B.dtype
 
     X = X.to(device=device, dtype=dtype)
 
-    dataset = TensorDataset(X)
-    dataloader = DataLoader(
-        dataset,
-        batch_size = 50000, #2048
-        shuffle    = False,  #True
-        drop_last  = False,
-    )
+    # dataset = TensorDataset(X)
+    # dataloader = DataLoader(
+    #     dataset,
+    #     batch_size = batch_size, #2048
+    #     shuffle    = False,  #True
+    #     drop_last  = False,
+    # )
     flow_params = [
         param
         for flow in model_to_train.flows
         for param in flow.parameters()
     ]
-    optimizerArgs = [
-        {
-            "params": flow_params,
-            "lr": 1e-3,
-        },
-        {
-            "params": [model_to_train.B],
-            "lr": 1e-3,
-        },
-        {
-            "params": [model_to_train.z],
-            "lr": 1e-3,
-        },
-    ]
-    optimizer = optim.Adam(optimizerArgs)
+    optimizer_args =    [
+            {
+                "params": flow_params,
+                "name": "flows",
+            },
+            {
+                "params": [model_to_train.B],
+                "name": "B",
+            },
+            {
+                "params": [model_to_train.z],
+                "name": "z",
+            },
+        ]
+    optimizer = torch.optim.Adam(optimizer_args) 
     # optimizer = optim.LBFGS(flow_params + [model_to_train.B, model_to_train.z], lr=1.0,history_size=2000, max_iter=20, line_search_fn="strong_wolfe")
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(
-        optimizer,
-        milestones=[200, 400],
-        gamma=0.5
-    )
+    # gamma = 0.2 ** (1.0 / num_epochs)
+
+    # scheduler = torch.optim.lr_scheduler.ExponentialLR(
+    #     optimizer,
+    #     gamma=gamma,
+    # )
     
-    batch_losses = []
+    # batch_losses = []
     losses = []
+    
+    #decompose logProbe
+    component_history = {
+        "q_total": [],
+        "q_marginal_total": [],
+        "q_copula_total": [],
+        "q_log_det": [],
+        "q_copula_quad": [],
+    }
+    diagnostic_every = 1
+    
     for epoch in tqdm(range(num_epochs)):
-        epoch_loss = 0.0
-        n_seen = 0
+        # make learning rates change periodically
+        update_learning_rates_pytorch(
+            optimizer=optimizer,
+            get_lr_for_group=get_lr_for_param,
+            step=epoch,
+        )
+        # epoch_loss = 0.0
+        # n_seen = 0
 
-        for (X_batch,) in dataloader:
-            X_batch = X_batch.to(device=device, dtype=dtype)  # [batch, M, D]
+        # for (X_batch,) in dataloader:
+        optimizer.zero_grad()
 
-            optimizer.zero_grad()
 
-            log_prob = model_to_train.log_prob(X_batch)  # [S, 1]
-            loss = -log_prob.mean()                      # scalar
+        log_prob = model_to_train.log_prob(X)                  # scalar
+        loss = -log_prob.mean()
+        loss.backward()
+        optimizer.step()
+        # def closure():
+        #     optimizer.zero_grad()
 
-            loss.backward()
-            optimizer.step()
-            # def closure():
-            #     optimizer.zero_grad()
+        #     log_prob = model_to_train.log_prob(X_batch)
+        #     loss = -log_prob.mean()
 
-            #     log_prob = model_to_train.log_prob(X_batch)
-            #     loss = -log_prob.mean()
+        #     loss.backward()
 
-            #     loss.backward()
+        #     return loss
 
-            #     return loss
-
-            # loss = optimizer.step(closure)
-            loss_value = loss.detach().cpu().item()
+        # loss = optimizer.step(closure)
+        loss_value = loss.detach().cpu().item()
 
             # Store loss for this specific minibatch
-            batch_losses.append(loss_value)
-            batch_n = X_batch.shape[0]
-            epoch_loss += loss_value* batch_n
-            n_seen += batch_n
+            # batch_losses.append(loss_value)
+            # batch_n = X_batch.shape[0]
+            # epoch_loss += loss_value* batch_n
+            # n_seen += batch_n
             
-        scheduler.step()
-        mean_epoch_loss = epoch_loss / n_seen
+        # scheduler.step()
+        mean_epoch_loss = loss_value# epoch_loss / n_seen
         losses.append(mean_epoch_loss)
-    return losses, batch_losses, dataloader
+        if epoch % diagnostic_every == 0:
+            diagnostics = compute_log_prob_diagnostics_from_model(
+                model=model_to_train,
+                value=X,
+                use_samples=False,
+            )
+
+            for key, value_diag in diagnostics.items():
+                if key not in component_history:
+                    component_history[key] = []
+                component_history[key].append(value_diag)
+    return losses,component_history#, batch_losses, dataloader
 
 def clone_tensor(x):
     return x.detach().cpu().clone()
@@ -545,15 +962,28 @@ def compare_models_manual(model_a, model_b, name_a="model_a", name_b="model_b", 
             print(diff)
 
 def SampleMLGaussianModel(N):
-    covTrue = torch.Tensor([
-        [1.0, 0.1, 0.1, 0.5],
-        [0.1, 1.0, 0.2, 0.3],
-        [0.1, 0.2, 1.0, 0.2],
-        [0.5, 0.3, 0.2, 1.0]
-    ])
-    loc = torch.tensor([0.,0.,0.,0.])
+    covTrue = 1000*torch.tensor([ 
+        [1.0, 0.5, 0.1, 0.3],
+        [0.5, 1.0, 0.2, 0.05],
+        [0.1, 0.2, 1.0, 0.45],
+        [0.3, 0.05, 0.45, 1.0],
+    ]) #[B,B]
+    # loc = torch.tensor([0.,0.,0.,0.])
+    
+    loc = torch.tensor([1.0,1.0,1.0,1.0])
+    # covTrue = torch.tensor([[0.4293, 0.1971, 0.0295, 0.1165],
+    #         [0.1971, 0.4317, 0.0766, 0.0094],
+    #         [0.0295, 0.0766, 0.4336, 0.1769],
+    #         [0.1165, 0.0094, 0.1769, 0.4317]])
+    
+    # loc = torch.tensor([[-0.0117, -0.0009, -0.0024,  0.0151]])
+    # covTrue = torch.tensor([[[1.0000, 0.5000, 0.5000, 0.5000],
+    #      [0.5000, 1.0000, 0.5000, 0.5000],
+    #      [0.5000, 0.5000, 1.0000, 0.5000],
+    #      [0.5000, 0.5000, 0.5000, 1.0000]]])
     dist = torch.distributions.MultivariateNormal(loc=loc
                                                     , covariance_matrix=covTrue)
+    
     return dist.sample(N),covTrue,loc
 
 def empirical_covariance(model, n_samples=10_000):
@@ -582,6 +1012,83 @@ def empirical_covariance(model, n_samples=10_000):
     ) / (S - 1)                         # [M, D, D]
 
     return X, mean, cov
+
+
+#plots
+def corner_plot_tensor(
+    X: torch.Tensor,
+    suffix: str
+):
+    """
+    Make a corner plot from a torch.Tensor.
+
+    Parameters
+    ----------
+    X : torch.Tensor
+        Tensor containing samples. Expected shapes include:
+            [N, D]
+            [N, 1, D]
+            [N, M, D]
+
+        If X has shape [N, 1, D], the singleton M dimension is removed.
+        If X has shape [N, M, D] with M > 1, it is flattened to [N*M, D].
+
+    labels : list[str], optional
+        Axis labels. If None, labels are generated as x_1, ..., x_D.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+        The corner plot figure.
+    """
+
+    X = X.detach().cpu()
+
+    if X.ndim == 1:
+        X = X[:, None]  # [N] -> [N, 1]
+
+    elif X.ndim == 2:
+        pass            # [N, D]
+
+    elif X.ndim == 3:
+        # [N, M, D] -> [N*M, D]
+        N, M, D = X.shape
+        X = X.reshape(N * M, D)
+
+    else:
+        raise ValueError(
+            f"Expected tensor with shape [N], [N, D], or [N, M, D], "
+            f"but got shape {tuple(X.shape)}"
+        )
+
+    X_np = X.numpy()
+
+    if not np.isfinite(X_np).all():
+        raise ValueError("Tensor contains NaN or Inf values.")
+
+    N, D = X_np.shape
+
+    labels = [rf"$x_{{{j+1}}}$" for j in range(D)]
+
+    fig = corner.corner(
+        X_np,
+        labels=labels,
+        bins=50,
+        show_titles=True,
+        title_fmt=".3f",
+        plot_datapoints=True,
+        plot_density=False,
+        plot_contours=True,
+        fill_contours=False,
+    )
+
+    fig.suptitle("Corner plot", fontsize=16)
+    fig.tight_layout()
+    filename = f"vector_copula_vi_v2/vector_copula_vi/Plots/corner_plot_individual{suffix}.png"
+
+    fig.savefig(filename, dpi=300, bbox_inches="tight")
+
+    return fig
 
 def plot_losses(epoch_losses,batch_losses,dataloader,suffix = "_1"):
     # Suppose these are returned by train(...)
@@ -892,24 +1399,116 @@ def plot_each_marginal_flow_output(
 
     return filenames
 
+def plot_marginal_pretraining_history(history,suffix):
+    plt.figure(figsize=(8, 4))
+
+    for key, values in history.items():
+        plt.plot(values, label=key, linewidth=1.2)
+
+    plt.xlabel("Epoch")
+    plt.ylabel("Negative log likelihood")
+    plt.title("Marginal flow pretraining")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    filename = (
+        f"vector_copula_vi_v2/vector_copula_vi/Plots/"
+        f"pretrained_marginals_loss{suffix}.png"
+    )
+    plt.savefig(filename, dpi=300, bbox_inches="tight")
+    plt.close()
+
+def copula_weight_schedule(step, warmup_steps=1000, max_weight=5.0):
+    """
+    Starts with high copula emphasis and anneals back to 1. -> so that we force learn the copula
+    """
+    if step >= warmup_steps:
+        return 1.0
+
+    t = step / warmup_steps
+
+    return max_weight * (1.0 - t) + 1.0 * t
+
+
+#genral functions
+def trainMLTruth(n_epochs):
+    suffix                           = "_pyro_v7_ML"
+    N_samples_plot                   = 10000
+
+    model_to_train                   = buildModel()
+    N_samples                        = 2000
+    PyroData,_,_                     = SampleMLGaussianModel([N_samples])
+    PyroData                         = PyroData.unsqueeze(1)
+    # corner_plot_tensor(PyroData,"_pyro_V6_ML_pyroData")
+    impl                             = pyroImplementation(PyroData)
+    X,_,_                            = impl.samplePosteriorTarget([N_samples])
+    
+    # corner_plot_tensor(X,"_pyro_V6_ML_X")
+    losses,_ = train(model_to_train,n_epochs,X,batch_size=N_samples,lr = 1e-3)
+    
+    # plot_losses(losses, batch_losses, dataloader,suffix = suffix)
+    plotLossesPyro(losses,suffix)
+
+    trainedSample = model_to_train.rsample([N_samples_plot])
+    make_corner_plot_two_clouds(X,trainedSample,suffix = suffix)
+    return impl,model_to_train,PyroData
+
 if __name__ == "__main__":
-    N                    = [10000]
+    suffix = "_PYRO_V9"
+    n_epochs                 = 2000  #10000
+    # #pyro
+    # impl,init_model,PyroData = trainMLTruth(10000)    
+    # statePath                = "/root/phd/GW_seperation_analysis/vector_copula_vi_v2/vector_copula_vi/Data/vector_copula_flow_warm_start.pt"
+    # torch.save(init_model.state_dict(), statePath)
+    
+    # print("stop")
+    
+    ## ML
+    N                    = [5000]
     # model_base           = buildModel()
     # X                    = model_base.sample(N)
-    X,_,_                = SampleMLGaussianModel(N)
+    
+    ## pyro
+    X,covTrue,_          = SampleMLGaussianModel(N)
     X_base               = X.unsqueeze(1)
+    PyroData             = X_base
     model_to_train       = buildModel()
+    # suffix = "temp_ML_fix"
+    # state = torch.load(
+    # statePath,
+    #     map_location=model_to_train.B.device,
+    # )
+    # model_to_train.load_state_dict(state)
+    
     N_samples_plot       = 10000
-    n_epochs             = 5000  #10000
     
     #classic ML
-    # losses, batch_losses, dataloader = train(model_to_train,600,X)
-    # plot_losses(losses, batch_losses, dataloader)
-    
+    # history_marginals = pretrain_marginal_flows(
+    #     flows=model_to_train.flows,
+    #     X=X,
+    #     block_sizes=[2, 2],
+    #     n_epochs=50,
+    #     batch_size=512,
+    #     lr=1e-3,
+    #     clip_norm=10.0,
+    # )   
+    # plot_marginal_pretraining_history(history_marginals,suffix)
+    # losses,component_history = train(model_to_train,
+    #                                 n_epochs,
+    #                                 X,
+    #                                 # lr_flows=2e-3,
+    #                                 # lr_B=1e-4,
+    #                                 # lr_z=1e-4
+    #     )
+    # plotLossesPyro(losses,suffix)
+    # plot_q_log_prob_components(component_history,suffix)
+    # # plot_losses(losses, batch_losses, dataloader, suffix = suffix)
+    # make_corner_plot_two_clouds(model_to_train.sample([N_samples_plot]),X_base,suffix = suffix)
+
+
     #Bayesian
-    suffix = "_pyro_v6"
+    impl = pyroImplementation(PyroData,covTrue)
     
-    impl = pyroImplementation(X_base)
     losses, component_history = impl.train(n_epochs)
     
     Trained_model = impl.get_trained_variational_model()
