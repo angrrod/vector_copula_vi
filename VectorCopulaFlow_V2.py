@@ -3,6 +3,9 @@ import torch
 from torch.distributions import constraints
 import torch.nn.functional as F
 
+import torch.nn as nn
+
+
 def Blockdiag(B,dimList):
     #B has shape[M,D,D]
     Bdiag = B.clone()
@@ -115,27 +118,39 @@ class VectorCopulaFlow(TorchDistribution):
     support         = constraints.real_vector
     has_rsample     = True  # set True if you implement rsample()
     
-    def __init__(self, flows:list, B:torch.Tensor, z:torch.Tensor):
+    def __init__(self, flows:list, B:torch.Tensor, z:torch.Tensor,distribs, debug_checks:bool = False):
         """
-        flow_n  Python list of Zuko flows modeling the margina
-        B       M x D x P matrix, where P < D, D is event_shape and M is the batch shape denoting different distributions, used in amortization
-        z       M vector parameter
+        args:
+            flows          Python list of Zuko flows modeling the margina
+            B              M x D x P matrix, where P < D, D is event_shape and M is the batch shape denoting different distributions, used in amortization
+            z              M vector parameter
+            debug_checks   bool indicating whether or not to check the parameter inputs for nan's
+            distribs       list of initialized zuko flows, describing the initialized flows
         """
         
         #test finitness of the input parameters
-        _assert_finite_tensor("B", B)
-        _assert_finite_tensor("z", z)
+        if debug_checks:
+            _assert_finite_tensor("B", B)
+            _assert_finite_tensor("z", z)
 
-        for i, flow in enumerate(flows):
-            if not isinstance(flow, torch.nn.Module):
-                raise TypeError(
-                    f"flows[{i}] must be a torch.nn.Module, got {type(flow)}"
-                )
+            for i, flow in enumerate(flows):
+                if not isinstance(flow, torch.nn.Module):
+                    raise TypeError(
+                        f"flows[{i}] must be a torch.nn.Module, got {type(flow)}"
+                    )
 
-            _assert_finite_module_parameters(f"flows[{i}]", flow)
+                _assert_finite_module_parameters(f"flows[{i}]", flow)
         
         self.flows = flows
-        self.distribs = [flow() for flow in flows]
+        if distribs is not None:
+            self.distribs = distribs
+        else:
+            self.distribs = [flow() for flow in flows] # condition 
+        
+        self.M           = B.shape[0]
+        self.D           = B.shape[1]
+        self.P           = B.shape[2] # low rank approximation
+        
         self.B      = B
         self.z      = z #[self.M]; we will take the softplus of this to obtain zeta to make it strictly positive
 
@@ -145,16 +160,12 @@ class VectorCopulaFlow(TorchDistribution):
         assert B.dtype == z.dtype, (
             f"Dtype mismatch: B has dtype {B.dtype}, z has dtype {z.dtype}"
         )
-        assert self.B.shape[1] > self.B.shape[2], (
+        assert self.D > self.P, (
             f"B must have shape D > P but got: D = {self.B.shape[1]}, P = {self.B.shape[2]}"
         )
         assert self.z.shape[0] == self.B.shape[0], (
             f"B must have shape batch size M as z, but got: M_B = {self.B.shape[0]}, M_z = {self.z.shape[0]}"
         )
-        
-        self.M          = self.B.shape[0]
-        self.D          = self.B.shape[1]
-        self.P          = self.B.shape[2] # low rank approximation
         
         self.blocksizes = [dist.event_shape[0] for dist in self.distribs]
         self.device     = B.device 
@@ -263,6 +274,7 @@ class VectorCopulaFlow(TorchDistribution):
         A_inv: torch.Tensor,
         zeta: torch.Tensor,
         L_K: torch.Tensor,
+        context = None
     ) -> torch.Tensor:
         """
         Computes logdet(Omega) without a D x D Cholesky.
@@ -300,6 +312,7 @@ class VectorCopulaFlow(TorchDistribution):
         return OmegaInverse,A_inv, zeta, L_K #return zeta, L_K for speed to do the calculation onely once
     
     def OmegaComponents(self):
+        
         I          = torch.eye(self.D, device=self.device, dtype = self.dtype)
         I_batch    = I.expand(self.M,self.D,self.D)  # [self.M, self.D, self.D]
         zeta       = F.softplus(self.z)#force zeta to be positive as it acts as regulartor fo positive definiteness
@@ -351,26 +364,27 @@ class VectorCopulaFlow(TorchDistribution):
     def sample(self, sample_shape=torch.Size()):
         with torch.no_grad():
             return self.rsample(sample_shape)#[sample_shape, self.M, self.D]
-    
-    def state_dict(self) -> dict:
-        """
-        Return a serializable state dict for warm-starting this distribution.
+        
+    # TODO:: remove when we dicide what to do with toy problem
+    # def state_dict(self) -> dict:
+    #     """
+    #     Return a serializable state dict for warm-starting this distribution.
 
-        Includes:
-        - all Zuko flow parameters
-        - B
-        - z
-        """
+    #     Includes:
+    #     - all Zuko flow parameters
+    #     - B
+    #     - z
+    #     """
 
-        return {
-            "flows": [flow.state_dict() for flow in self.flows],
-            "B": self.B.detach().clone(),
-            "z": self.z.detach().clone(),
-            "blocksizes": list(self.blocksizes),
-            "D": self.D,
-            "P": self.P,
-            "M": self.M,
-        }
+    #     return {
+    #         "flows": [flow.state_dict() for flow in self.flows],
+    #         "B": self.B.detach().clone(),
+    #         "z": self.z.detach().clone(),
+    #         "blocksizes": list(self.blocksizes),
+    #         "D": self.D,
+    #         "P": self.P,
+    #         "M": self.M,
+    #     }
 
     def load_state_dict(self, state: dict, strict: bool = True):
         """
@@ -411,3 +425,53 @@ class VectorCopulaFlow(TorchDistribution):
         with torch.no_grad():
             self.B.copy_(state["B"].to(device=self.B.device, dtype=self.B.dtype))
             self.z.copy_(state["z"].to(device=self.z.device, dtype=self.z.dtype))
+
+    def sample_and_log_prob(self,N):
+        samples = self.sample(sample_shape=N)
+        log_q   = self.log_prob(samples)
+        return samples,log_q
+    
+#TODO: Test too many calls to vectorCopulaFlow
+class AmortizedVectorCopulaFlow(nn.Module):
+    """
+    extenstion of the vector copula flow to amortized zetting
+    
+    args:
+    flows            Python list of Zuko flows modeling the margina
+    parameter_net    neural network, that allows to obtain the model parameters conditional on the context
+    debug_checks     bool, allow certain test options
+    """
+    def __init__(self, flows, parameter_net, debug_checks=False):
+        super().__init__()
+        self.flows = flows
+        self.parameter_net = parameter_net
+        self.debug_checks = debug_checks
+
+    def distribution(self, context):
+        B, z = self.parameter_net(context)
+        distribs = [flow(context) for flow in self.flows] #needed for amortization
+        
+        #initialize a new object everytime, but we need to make the constructor as light as possible
+        return VectorCopulaFlow(
+            flows=self.flows,
+            B=B,
+            z=z,
+            distribs = distribs,
+            debug_checks = self.debug_checks
+        )
+
+    def log_prob(self, value, context):
+        return self.distribution(context).log_prob(value)
+
+    def log_prob_components(self, value, context):
+        return self.distribution(context).log_prob_components(value)
+
+    def rsample(self, sample_shape=torch.Size(), context=None):
+        return self.distribution(context).rsample(sample_shape)
+
+    def sample(self, sample_shape=torch.Size(), context=None):
+        with torch.no_grad():
+            return self.rsample(sample_shape, context)
+        
+    def sample_and_log_prob(self,N, context):
+        return self.distribution(context).sample_and_log_prob(N)
