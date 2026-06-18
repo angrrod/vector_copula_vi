@@ -147,13 +147,12 @@ class VectorCopulaFlow(TorchDistribution):
         else:
             self.distribs = [flow() for flow in flows] # condition 
         
-        self.M           = B.shape[0]
-        self.D           = B.shape[1]
-        self.P           = B.shape[2] # low rank approximation
-        
         self.B      = B
-        self.z      = z #[self.M]; we will take the softplus of this to obtain zeta to make it strictly positive
-
+        self.z      = z     #[self.M]; we will take the softplus of this to obtain zeta to make it strictly positive
+        self.M      = B.shape[0]
+        self.D      = B.shape[1]
+        self.P      = B.shape[2] # low rank approximation
+        
         assert B.device == z.device, (
             f"Device mismatch: z is on {z.device}, B is on {B.device}"
         )
@@ -435,29 +434,30 @@ class VectorCopulaFlow(TorchDistribution):
 class AmortizedVectorCopulaFlow(nn.Module):
     """
     extenstion of the vector copula flow to amortized zetting
-    
-    args:
-    flows            Python list of Zuko flows modeling the margina
-    parameter_net    neural network, that allows to obtain the model parameters conditional on the context
-    debug_checks     bool, allow certain test options
     """
-    def __init__(self, flows, parameter_net, debug_checks=False):
+    def __init__(self, flows:list, parameter_net:nn.Module, debug_checks:bool=False):
+        """
+            args:
+            flows            Python list of Zuko flows modeling the margina
+            parameter_net    neural network, that allows to obtain the model parameters conditional on the context
+            debug_checks     bool, allow certain test options
+        """
         super().__init__()
-        self.flows = flows
+        self.flows         = flows
         self.parameter_net = parameter_net
-        self.debug_checks = debug_checks
+        self.debug_checks  = debug_checks
 
     def distribution(self, context):
-        B, z = self.parameter_net(context)
+        B, z     = self.parameter_net(context)
         distribs = [flow(context) for flow in self.flows] #needed for amortization
         
         #initialize a new object everytime, but we need to make the constructor as light as possible
         return VectorCopulaFlow(
-            flows=self.flows,
-            B=B,
-            z=z,
-            distribs = distribs,
-            debug_checks = self.debug_checks
+            flows         = self.flows,
+            B             = B,
+            z             = z,
+            distribs      = distribs,
+            debug_checks  = self.debug_checks
         )
 
     def log_prob(self, value, context):
