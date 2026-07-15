@@ -2,8 +2,6 @@
 import zuko
 import matplotlib.pyplot as plt
 import torch.optim as optim
-from VectorCopulaFlow import VectorCopulaFlow
-from VectorCopulaFlow_V2 import VectorCopulaFlow_V2
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
@@ -15,12 +13,13 @@ import corner
 import pyro
 import pyro.distributions as dist
 from pyro.infer import SVI, Trace_ELBO
-from pyro.optim import Adam,ClippedAdam
+from pyro.optim import Adam, ClippedAdam
 from pyro.optim import MultiStepLR
 import os
 import math
 import torch.nn.functional as F
 from tqdm import trange
+from vector_copula_vi.VectorCopulaFlow_V2  import ZukoVectorCopulaFlow
 
 class IdentityTransform:
     domain = constraints.real_vector
@@ -166,7 +165,7 @@ def optim_args(param_name):
 
 def get_lr_for_param(param_name, step):
     if param_name == "B":
-        base_lr = 1e-3
+        base_lr = 5e-4
         factor = cosine_cycle(
             step,
             cycle_length=500,
@@ -175,7 +174,7 @@ def get_lr_for_param(param_name, step):
         )
 
     elif param_name == "z":
-        base_lr = 1e-3
+        base_lr = 5e-4
         factor = cosine_cycle(
             step,
             cycle_length=500,
@@ -184,7 +183,7 @@ def get_lr_for_param(param_name, step):
         )
 
     else:
-        base_lr = 1e-3
+        base_lr = 5e-4
         factor = shifted_cosine_cycle(
             step,
             cycle_length=500,
@@ -257,7 +256,7 @@ class pyroImplementation:
         B     = pyro.param("B", self.B_init) #B = to existing parameter in param store or if it is not present, self.B_init
         z     = pyro.param("z", self.z_init)
             
-        q = VectorCopulaFlow_V2(
+        q = ZukoVectorCopulaFlow(
             flows                = self.flows,
             B                    = B,
             z                    = z,
@@ -314,7 +313,7 @@ class pyroImplementation:
             B = B.detach().clone()
             z = z.detach().clone()
 
-        q = VectorCopulaFlow_V2(
+        q = ZukoVectorCopulaFlow(
             flows=self.flows,
             B=B,
             z=z,
@@ -417,12 +416,12 @@ def compute_log_prob_diagnostics_from_model(
     use_samples=False,
 ):
     """
-    Compute diagnostic components of log_prob for a VectorCopulaFlow_V2 model.
+    Compute diagnostic components of log_prob for a ZukoVectorCopulaFlow model.
 
     Parameters
     ----------
     model:
-        VectorCopulaFlow_V2 instance.
+        ZukoVectorCopulaFlow instance.
 
     value:
         Tensor used for diagnostics. Usually training data X.
@@ -519,7 +518,7 @@ def getInitModelParams(TrainIdentity = False):
 
 def buildModel():
     flows,B,z = getInitModelParams()
-    model = VectorCopulaFlow_V2(
+    model = ZukoVectorCopulaFlow(
         flows = flows,       
         B     = B,
         z     = z
@@ -776,7 +775,7 @@ def pretrain_marginal_flows(
 
 def train(model_to_train,num_epochs,
         X,
-        batch_size = 50000, 
+        batch_size = 5000, 
         # lr_flows=1e-3,
         # lr_B=5e-2,
         # lr_z=5e-2
@@ -1315,7 +1314,7 @@ def plot_each_marginal_flow_output(
 
     Args:
         q:
-            VectorCopulaFlow_V2 object.
+            ZukoVectorCopulaFlow object.
         N:
             Number of base samples per marginal flow.
         out_dir:
@@ -1454,8 +1453,8 @@ def trainMLTruth(n_epochs):
     return impl,model_to_train,PyroData
 
 if __name__ == "__main__":
-    suffix = "_PYRO_V9"
-    n_epochs                 = 2000  #10000
+    suffix = "__PYRO_V10"
+    n_epochs                 = 500  #10000
     # #pyro
     # impl,init_model,PyroData = trainMLTruth(10000)    
     # statePath                = "/root/phd/GW_seperation_analysis/vector_copula_vi_v2/vector_copula_vi/Data/vector_copula_flow_warm_start.pt"
@@ -1464,7 +1463,7 @@ if __name__ == "__main__":
     # print("stop")
     
     ## ML
-    N                    = [5000]
+    N                    = [2000]
     # model_base           = buildModel()
     # X                    = model_base.sample(N)
     
