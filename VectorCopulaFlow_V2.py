@@ -48,6 +48,9 @@ def getLogCopulaTerm(Q: torch.Tensor,Mmat: torch.Tensor):
     quad = (Q_flat * MQ).sum(dim=-1)  # [S*M]
     return quad.reshape(S, M)          # [S, M]
 
+def positive_zeta(z, eps=1e-6):
+    return F.softplus(z) + eps
+
 def WoodburyComponents(z: torch.Tensor,B: torch.Tensor) -> torch.Tensor:
     """returns the inverse of (zeta*I + B*B^T) using the woodbury formula, this inverts a PxP matrix instead of a DxD matrix which is faster for low rank approximations 
 
@@ -58,7 +61,7 @@ def WoodburyComponents(z: torch.Tensor,B: torch.Tensor) -> torch.Tensor:
     Returns:
         torch.Tensor: inverse of (zeta*I + B*B^T)
     """
-    zeta    = F.softplus(z)
+    zeta    = positive_zeta(z)
     M, D, P = B.shape
     Bt      = B.transpose(-1, -2)
     zeta_b  = zeta.view(M, 1, 1)  # [M, 1, 1]
@@ -142,7 +145,7 @@ class BaseVectorCopulaFlow(TorchDistribution,ABC):
         self.flows = flows
         
         self.B      = B
-        self.z      = z     #[self.M]; we will take the softplus of this to obtain zeta to make it strictly positive
+        self.z      = z    #[self.M]; we will take the softplus of this to obtain zeta to make it strictly positive
         self.M      = B.shape[0]
         self.D      = B.shape[1]
         self.P      = B.shape[2] # low rank approximation
@@ -238,7 +241,7 @@ class BaseVectorCopulaFlow(TorchDistribution,ABC):
         
         I          = torch.eye(self.D, device=self.device, dtype = self.dtype)
         I_batch    = I.expand(self.M,self.D,self.D)  # [self.M, self.D, self.D]
-        zeta       = F.softplus(self.z)#force zeta to be positive as it acts as regulartor fo positive definiteness
+        zeta       = positive_zeta(self.z)#force zeta to be positive as it acts as regulartor fo positive definiteness
         OmegaTilde = zeta[:, None, None] * I_batch + self.B @ self.B.transpose(-1, -2) # [self.M, self.D, self.D]
 
         if not torch.isfinite(OmegaTilde).all():
@@ -248,7 +251,7 @@ class BaseVectorCopulaFlow(TorchDistribution,ABC):
         A_inv = torch.linalg.cholesky(Bd)      # [self.M, self.D, self.D]
         return OmegaTilde, A_inv
     
-    def Omega(self):
+    def Omega(self, symmetrize: bool = False):
         OmegaTilde, A_inv = self.OmegaComponents()
         # Compute A @ OmegaTilde without explicitly forming A
         X = torch.linalg.solve_triangular(
@@ -264,12 +267,19 @@ class BaseVectorCopulaFlow(TorchDistribution,ABC):
             X.transpose(-1, -2),
             upper=False,
             left=True
-        ).transpose(-1, -2)            
+        ).transpose(-1, -2)   
+        
+        #symetrize to enforce symmetry constraint
+        if symmetrize:  
+            Omega = 0.5 * (
+                Omega + Omega.transpose(-1, -2)
+            )
+         
         return Omega # [self.M, self.D, self.D]
     
-    def sample(self, sample_shape=torch.Size()):
+    def sample(self, sample_shape=torch.Size(), symmetrize_omega:bool = True):
         with torch.no_grad():
-            return self.rsample(sample_shape)#[sample_shape, self.M, self.D]
+            return self.rsample(sample_shape, symmetrize_omega)#[sample_shape, self.M, self.D]
     
     def sample_and_log_prob(self,N):
         samples = self.sample(sample_shape=N)
@@ -373,11 +383,11 @@ class BaseVectorCopulaFlow(TorchDistribution,ABC):
 
         return components
 
-    def rsample(self, sample_shape=torch.Size()):
+    def rsample(self, sample_shape=torch.Size(), symmetrize_omega:bool = False):
         if isinstance(sample_shape, int):
             sample_shape = (sample_shape,)
         
-        Omega = self.Omega()
+        Omega = self.Omega(symmetrize_omega)
 
         multi_normal = torch.distributions.MultivariateNormal(
             loc=torch.zeros(
@@ -472,14 +482,15 @@ class DingoVectorCopulaFlow(BaseVectorCopulaFlow):
             value (torch.Tensor): the tensor used for evaluation of the log_prob (so a parameter tensor)
         """
         context = self.context
-        if (len(self.context.shape) == 2) & (len(value.shape) == 3): #hit
-            value = value.squeeze(1)
-        if (len(self.context.shape) == 3) & (len(value.shape) == 2):
-            context = context.squeeze(1)
-        if (context.shape[0] == 1) & (value.shape[0] != 1):
-            context = context.expand(value.shape[0],-1)
-        #TODO: test which sizes fit -> bring out of function
-        # self.flows[0].log_prob(value_i.squeeze(1), context.squeeze(1))
+        if context is not None:
+            if (len(self.context.shape) == 2) & (len(value.shape) == 3): #hit
+                value = value.squeeze(1)
+            if (len(self.context.shape) == 3) & (len(value.shape) == 2):
+                context = context.squeeze(1)
+            if (context.shape[0] == 1) & (value.shape[0] != 1):
+                context = context.expand(value.shape[0],-1)
+            #TODO: test which sizes fit -> bring out of function
+            # self.flows[0].log_prob(value_i.squeeze(1), context.squeeze(1))
         return context,value
     
     def _reshape_for_sampling(self, value: torch.Tensor):
@@ -494,10 +505,13 @@ class DingoVectorCopulaFlow(BaseVectorCopulaFlow):
             value (torch.Tensor): value of the log probability, to be evaluated
         """
         context = self.context
-        if (len(self.context.shape) == 2) & (len(value.shape) == 3):
+        if context is not None:
+            if (len(self.context.shape) == 2) & (len(value.shape) == 3):
+                value = value.squeeze(1)
+            if (self.context.shape[0] == 1) & (value.shape[0] != 1):
+                context = self.context.expand(value.shape[0], -1)
+        else:
             value = value.squeeze(1)
-        if (self.context.shape[0] == 1) & (value.shape[0] != 1):
-            context = self.context.expand(value.shape[0], -1)
         return value, context
 
 #TODO: Test too many calls to vectorCopulaFlow
@@ -566,4 +580,5 @@ class AmortizedVectorCopulaFlow(nn.Module):
     
     def sample_and_log_prob(self,N, context):
         return self.distribution(context).sample_and_log_prob(N)
+    
     

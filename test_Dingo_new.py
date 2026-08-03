@@ -6,7 +6,15 @@ import corner
 from dingo.core.posterior_models.vector_copula_Model import CopulaNormalizingFlowModel
 from torch.utils.data import Dataset, DataLoader, random_split
 from tqdm import tqdm
-
+from dataclasses import dataclass
+import utils
+from config import ScenarioConfig
+from setUpLoggerScenario import setUpLoggerScenario
+from pathlib import Path
+import os
+import pandas as pd
+from matplotlib.lines import Line2D
+import torch
 class IdentityContextEmbedding(torch.nn.Module):
     def __init__(self, input_dim=4, output_dim=4):
         super().__init__()
@@ -272,9 +280,9 @@ def make_copula_sbi_metadata():
                     },
                 },
                 "embedding_kwargs": {
-                    "type": "identity",
-                    "input_dim": 4,
-                    "output_dim": 4,
+                    # "type": "identity",
+                    # "input_dim": 4,
+                    # "output_dim": 4,
                 },
             }
         },
@@ -368,7 +376,7 @@ def make_corner_plot_two_clouds(
         range=ranges,
         bins=40,
         color="C0",
-        hist_kwargs={"density": True, "alpha": 0.5},
+        hist_kwargs={"alpha": 0.5},
         plot_datapoints=True,
         plot_density=False,
         plot_contours=True,
@@ -384,7 +392,7 @@ def make_corner_plot_two_clouds(
         range=ranges,
         bins=40,
         color="C1",
-        hist_kwargs={"density": True, "alpha": 0.5},
+        hist_kwargs={"alpha": 0.5},
         plot_datapoints=True,
         plot_density=False,
         plot_contours=True,
@@ -580,7 +588,7 @@ def check_flow_parameter_registration(model):
 
 #     print("\nDataset distribution test passed.")
 
-if __name__ == "__main__":
+def main_sbi():
     suffix         = "___DINGO_V1"
     N_samples_plot = 10000
     priorVar       = 2.0
@@ -683,3 +691,989 @@ if __name__ == "__main__":
     print(f"mean_train: {mean_train}")
 
     print(f"F-Norm: {torch.norm(cov_base - cov_train.squeeze(0))}")
+
+################################ ML ##############################
+
+def _atomic_torch_save(payload: dict, output_path):
+    """
+    Write a checkpoint atomically.
+
+    The temporary file is replaced only after torch.save succeeds, reducing
+    the chance of leaving a corrupt checkpoint after an interruption.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    temporary_path = output_path.with_suffix(
+        output_path.suffix + ".tmp"
+    )
+
+    torch.save(payload, temporary_path)
+    os.replace(temporary_path, output_path)
+
+def save_copula_ml_checkpoint(
+    output_path,
+    *,
+    model,
+    metadata,
+    parameter_names,
+    loss_history,
+    completed_epochs,
+    best_loss,
+    optimizer=None,
+    scheduler=None,
+    data_source=None,
+):
+    checkpoint = {
+        "checkpoint_format_version": 1,
+        "completed_epochs": int(completed_epochs),
+        "best_loss": float(best_loss),
+        "loss_history": [
+            float(loss) for loss in loss_history
+        ],
+
+        # The actual fitted model.
+        "model_state_dict": model.network.state_dict(),
+
+        # Required to reconstruct exactly the same architecture.
+        "metadata": metadata,
+
+        # Required to preserve the HDF5 column ordering.
+        "parameter_names": [
+            str(name) for name in parameter_names
+        ],
+
+        "data_source": (
+            str(data_source)
+            if data_source is not None
+            else None
+        ),
+
+        # These are None for a weights-only checkpoint.
+        "optimizer_state_dict": (
+            optimizer.state_dict()
+            if optimizer is not None
+            else None
+        ),
+        "scheduler_state_dict": (
+            scheduler.state_dict()
+            if scheduler is not None
+            else None
+        ),
+
+        # Useful for approximately continuing shuffled minibatches.
+        "torch_rng_state": torch.get_rng_state(),
+        "cuda_rng_state_all": (
+            torch.cuda.get_rng_state_all()
+            if torch.cuda.is_available()
+            else None
+        ),
+    }
+
+    _atomic_torch_save(
+        checkpoint,
+        output_path,
+    )
+
+    print(f"Saved checkpoint: {output_path}")
+
+def _optimizer_to_device(optimizer, device):
+    """
+    Move tensors stored inside an optimizer state to the target device.
+    """
+    device = torch.device(device)
+
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device)
+
+def load_copula_ml_checkpoint(
+    checkpoint_path,
+    *,
+    device="cpu",
+    restore_optimizer=True,
+):
+    checkpoint_path = Path(checkpoint_path)
+
+    # Only load checkpoints you created yourself.
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location=device,
+        weights_only=False,
+    )
+
+    metadata = checkpoint["metadata"]
+
+    model = CopulaNormalizingFlowModel(
+        metadata=metadata,
+        device=device,
+    )
+
+    model.network.load_state_dict(
+        checkpoint["model_state_dict"],
+        strict=True,
+    )
+
+    optimizer = None
+    scheduler = None
+
+    optimizer_state = checkpoint.get(
+        "optimizer_state_dict"
+    )
+    scheduler_state = checkpoint.get(
+        "scheduler_state_dict"
+    )
+
+    if restore_optimizer and optimizer_state is not None:
+        saved_lr = optimizer_state["param_groups"][0]["lr"]
+
+        optimizer = torch.optim.Adam(
+            model.network.parameters(),
+            lr=saved_lr,
+        )
+
+        optimizer.load_state_dict(
+            optimizer_state
+        )
+
+        _optimizer_to_device(
+            optimizer,
+            device,
+        )
+
+        if scheduler_state is not None:
+            saved_gamma = scheduler_state.get(
+                "gamma",
+                1.0,
+            )
+
+            scheduler = (
+                torch.optim.lr_scheduler.ExponentialLR(
+                    optimizer,
+                    gamma=saved_gamma,
+                )
+            )
+
+            scheduler.load_state_dict(
+                scheduler_state
+            )
+
+    rng_state = checkpoint.get("torch_rng_state")
+
+    if rng_state is not None:
+        torch.set_rng_state(rng_state.cpu())
+
+    cuda_rng_state = checkpoint.get(
+        "cuda_rng_state_all"
+    )
+
+    if (
+        cuda_rng_state is not None
+        and torch.cuda.is_available()
+    ):
+        torch.cuda.set_rng_state_all(
+            cuda_rng_state
+        )
+
+    print(f"Loaded checkpoint: {checkpoint_path}")
+    print(
+        "Completed epochs:",
+        checkpoint.get("completed_epochs", 0),
+    )
+    print(
+        "Best stored loss:",
+        checkpoint.get("best_loss"),
+    )
+
+    return model, optimizer, scheduler, checkpoint
+
+def plot_ml_losses(
+    losses,
+    output_path,
+    moving_average_window=10,
+    skip_initial_epochs=20,
+):
+    losses = np.asarray(losses, dtype=float)
+
+    if losses.ndim != 1 or losses.size == 0:
+        raise ValueError(
+            f"Expected a non-empty one-dimensional loss array, "
+            f"got shape {losses.shape}."
+        )
+
+    if not np.isfinite(losses).all():
+        raise ValueError("Loss history contains NaN or Inf.")
+
+    epochs = np.arange(1, losses.size + 1)
+
+    skip = int(skip_initial_epochs)
+    if skip < 0 or skip >= losses.size:
+        raise ValueError(
+            f"skip_initial_epochs must be between 0 and "
+            f"{losses.size - 1}, got {skip}."
+        )
+
+    # Apply the same trimming to every plotted diagnostic.
+    plotted_losses = losses[skip:]
+    plotted_epochs = epochs[skip:]
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+
+    ax.plot(
+        plotted_epochs,
+        plotted_losses,
+        linewidth=1.0,
+        alpha=0.65,
+        label="Training NLL",
+    )
+
+    window = min(
+        int(moving_average_window),
+        plotted_losses.size,
+    )
+
+    if window >= 2:
+        kernel = np.ones(window, dtype=float) / window
+
+        smoothed = np.convolve(
+            plotted_losses,
+            kernel,
+            mode="valid",
+        )
+
+        # The first moving-average value corresponds to the final epoch
+        # in the first averaging window.
+        smoothed_epochs = plotted_epochs[window - 1:]
+
+        ax.plot(
+            smoothed_epochs,
+            smoothed,
+            linewidth=2.0,
+            label=f"{window}-epoch moving average",
+        )
+
+    # Minimum among the epochs actually displayed.
+    best_index = int(np.argmin(plotted_losses))
+    best_epoch = int(plotted_epochs[best_index])
+    best_loss = float(plotted_losses[best_index])
+
+    ax.scatter(
+        best_epoch,
+        best_loss,
+        marker="o",
+        label=f"Minimum: {best_loss:.6g} (epoch {best_epoch})",
+        zorder=3,
+    )
+
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Negative log-likelihood per sample")
+    ax.set_title(
+        "Unconditional copula maximum-likelihood training"
+    )
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    fig.tight_layout()
+    fig.savefig(
+        output_path,
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
+
+def print_fitted_copula_model(
+    model,
+    parameter_names,
+    output_dir=None,
+):
+    """
+    Print and optionally save the fitted non-amortized copula parameters.
+
+    B and raw z are the optimized parameterization. Omega is the implied
+    normalized copula matrix and is the more interpretable fitted object.
+    """
+    network = model.network
+
+    if getattr(network, "conditional", True):
+        raise ValueError(
+            "print_fitted_copula_model() expects an unconditional copula model."
+        )
+
+    if not hasattr(network, "B") or not hasattr(network, "z"):
+        raise AttributeError(
+            "The unconditional network must expose trainable B and z parameters."
+        )
+
+    parameter_names = list(parameter_names)
+    if len(parameter_names) != network.D:
+        raise ValueError(
+            f"Received {len(parameter_names)} parameter names, but model D={network.D}."
+        )
+
+    network.eval()
+    with torch.no_grad():
+        fitted_distribution = network.distribution()
+
+        B = network.B.detach().cpu().squeeze(0)
+        z_raw = network.z.detach().cpu().reshape(-1)
+        zeta = torch.nn.functional.softplus(z_raw)
+        omega = fitted_distribution.Omega().detach().cpu().squeeze(0)
+
+    factor_names = [f"factor_{j + 1}" for j in range(B.shape[1])]
+    B_df = pd.DataFrame(
+        B.numpy(),
+        index=parameter_names,
+        columns=factor_names,
+    )
+    omega_df = pd.DataFrame(
+        omega.numpy(),
+        index=parameter_names,
+        columns=parameter_names,
+    )
+
+    block_dims = list(network.block_dims)
+    if sum(block_dims) != network.D:
+        raise ValueError(
+            f"block_dims={block_dims} do not sum to D={network.D}."
+        )
+
+    if len(block_dims) == 2:
+        split = block_dims[0]
+        omega_cross_df = omega_df.iloc[:split, split:]
+    else:
+        omega_cross_df = None
+
+    print("\n=== FINAL FITTED NON-AMORTIZED COPULA MODEL ===")
+    print(f"Event dimension D: {network.D}")
+    print(f"Low-rank dimension P: {B.shape[1]}")
+    print(f"Block dimensions: {block_dims}")
+    print(f"Raw z: {z_raw.numpy()}")
+    print(f"zeta = softplus(z): {zeta.numpy()}")
+
+    print("\nB factor matrix:")
+    print(B_df.to_string(float_format=lambda x: f"{x: .6f}"))
+
+    print("\nImplied normalized copula matrix Omega:")
+    print(omega_df.to_string(float_format=lambda x: f"{x: .6f}"))
+
+    if omega_cross_df is not None:
+        print("\nCross-block copula matrix Omega_AB:")
+        print(
+            omega_cross_df.to_string(
+                float_format=lambda x: f"{x: .6f}"
+            )
+        )
+
+    if output_dir is not None:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        B_path = output_dir / "fitted_copula_B.csv"
+        omega_path = output_dir / "fitted_copula_Omega.csv"
+        B_df.to_csv(B_path)
+        omega_df.to_csv(omega_path)
+
+        print("\nSaved fitted copula parameters:")
+        print(f"B:     {B_path}")
+        print(f"Omega: {omega_path}")
+
+        if omega_cross_df is not None:
+            omega_cross_path = output_dir / "fitted_copula_Omega_AB.csv"
+            omega_cross_df.to_csv(omega_cross_path)
+            print(f"Omega_AB: {omega_cross_path}")
+
+    return {
+        "B": B,
+        "z_raw": z_raw,
+        "zeta": zeta,
+        "Omega": omega,
+        "B_dataframe": B_df,
+        "Omega_dataframe": omega_df,
+        "Omega_AB_dataframe": omega_cross_df,
+    }
+
+def train_copula_ML(
+    model,
+    train_loader,
+    n_epochs=200,
+    lr=2e-3,
+    device="cpu",
+    checkpoint_path="postProcessing/copula_ml/copula_ml_best.pt",
+    start_from_best=False,
+):
+    checkpoint_path = Path(checkpoint_path)
+    checkpoint_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    previous_epochs = 0
+    best_loss = float("inf")
+
+    # Optionally start from the previously stored best model.
+    if start_from_best:
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(
+                f"Cannot continue training because no checkpoint exists at:\n"
+                f"{checkpoint_path}"
+            )
+
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location=device,
+            weights_only=False,
+        )
+
+        model.network.load_state_dict(
+            checkpoint["model_state_dict"],
+            strict=True,
+        )
+
+        best_loss = float(checkpoint["best_loss"])
+        previous_epochs = int(
+            checkpoint.get("epoch", 0)
+        )
+
+        print("\nLoaded best copula model")
+        print(f"Checkpoint:       {checkpoint_path}")
+        print(f"Stored epoch:     {previous_epochs}")
+        print(f"Stored best NLL:  {best_loss:.6f}")
+
+    else:
+        print("\nStarting copula training from current initialization.")
+    model.network.train()
+        
+    ### ADAM
+    lr_min  = 1e-7
+    gamma = (lr_min / lr) ** (1 / n_epochs)
+    optimizer = torch.optim.Adam(
+        model.network.parameters(),
+        lr=lr,
+    )
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(
+        optimizer,
+        gamma=gamma,
+    )
+    losses = []
+
+    for epoch in tqdm(range(n_epochs)):
+        epoch_loss = 0.0
+        n_seen = 0
+
+        for theta in train_loader:
+            theta = theta.to(device)
+
+            optimizer.zero_grad(set_to_none=True)
+
+            loss = model.loss(theta)
+
+            if not torch.isfinite(loss):
+                raise ValueError(f"Non-finite loss at epoch {epoch}: {loss}")
+
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(
+                model.network.parameters(),
+                max_norm=10.0,
+            )
+
+            optimizer.step()
+
+            batch_size = theta.shape[0]
+
+            epoch_loss += (
+                loss.detach().cpu().item()
+                * batch_size
+            )
+            n_seen += batch_size
+
+        average_loss = epoch_loss / n_seen
+        losses.append(average_loss)
+
+        absolute_epoch = (
+            previous_epochs + epoch + 1
+        )
+
+        # Save only when the model improves on the stored best model.
+        if average_loss < best_loss:
+            best_loss = average_loss
+
+            torch.save(
+                {
+                    "model_state_dict": (
+                        model.network.state_dict()
+                    ),
+                    "best_loss": best_loss,
+                    "epoch": absolute_epoch,
+                },
+                checkpoint_path,
+            )
+
+            print(
+                f"\nSaved new best model: "
+                f"epoch={absolute_epoch}, "
+                f"NLL={best_loss:.6f}"
+            )
+
+        scheduler.step()
+
+    # Ensure all diagnostics and sampling use the best model,
+    # rather than merely the weights from the final epoch.
+    best_checkpoint = torch.load(
+        checkpoint_path,
+        map_location=device,
+        weights_only=False,
+    )
+
+    model.network.load_state_dict(
+        best_checkpoint["model_state_dict"],
+        strict=True,
+    )
+
+    model.network.eval()
+
+    print("\nRestored best model after training")
+    print(
+        f"Best epoch: {best_checkpoint['epoch']}"
+    )
+    print(
+        f"Best NLL:   {best_checkpoint['best_loss']:.6f}"
+    )
+
+    return losses
+
+def make_copula_ml_metadata():
+    return {
+        "dataset_settings": {
+            "type": "posterior_samples_ml",
+            "theta_dim": 30,
+        },
+        "train_settings": {
+            "model": {
+                "posterior_model_type": "copula_normalizing_flow",
+                "posterior_kwargs": {
+                    "conditional": False,
+                    "block_dims": [15, 15],
+                    "flows": {
+                        "flow_1": {
+                            "num_flow_steps": 4,
+                            "base_transform_kwargs": {
+                                "hidden_dim": 64,
+                                "num_transform_blocks": 4,
+                                "activation": "elu",
+                                "dropout_probability": 0.0,
+                                "batch_norm": True,
+                                "num_bins": 32,
+                                "base_transform_type": "rq-coupling",
+                            },
+                        },
+                        "flow_2": {
+                            "num_flow_steps": 4,
+                            "base_transform_kwargs": {
+                                "hidden_dim": 64,
+                                "num_transform_blocks": 4,
+                                "activation": "elu",
+                                "dropout_probability": 0.0,
+                                "batch_norm": True,
+                                "num_bins": 32,
+                                "base_transform_type": "rq-coupling",
+                            },
+                        },
+                    },
+                    "CopulaKwargs": {
+                        "P": 8,
+                    },
+                },
+
+                # Explicitly absent.
+                "embedding_kwargs": None,
+            }
+        },
+    }
+
+def _samples_to_2d_numpy(samples, name: str) -> np.ndarray:
+    """
+    Convert training or generated samples to shape [N, D].
+
+    Supported inputs:
+        [N, D]
+        [N, 1, D]
+        [1, N, D]
+    """
+    if torch.is_tensor(samples):
+        samples = samples.detach().cpu().numpy()
+    else:
+        samples = np.asarray(samples)
+
+    if samples.ndim == 3:
+        if samples.shape[1] == 1:
+            # Unconditional copula output: [N, 1, D]
+            samples = samples[:, 0, :]
+        elif samples.shape[0] == 1:
+            # Alternative Dingo convention: [1, N, D]
+            samples = samples[0, :, :]
+        else:
+            raise ValueError(
+                f"{name} has ambiguous three-dimensional shape "
+                f"{samples.shape}. Expected [N, 1, D] or [1, N, D]."
+            )
+
+    if samples.ndim != 2:
+        raise ValueError(
+            f"{name} must reduce to shape [N, D], "
+            f"but has shape {samples.shape}."
+        )
+
+    if not np.isfinite(samples).all():
+        raise ValueError(f"{name} contains NaN or Inf.")
+
+    return samples
+
+def plot_ml_training_vs_samples_corner(
+    model,
+    training_data,
+    parameter_names,
+    output_path,
+    *,
+    selected_parameters=None,
+    n_model_samples=5000,
+    max_training_samples=5000,
+    bins=35,
+    quantile_range=(0.005, 0.995),
+    random_seed=1234,
+):
+    """
+    Overlay training data and samples from a fitted unconditional ML model.
+
+    Parameters
+    ----------
+    model
+        Trained CopulaNormalizingFlowModel.
+
+    training_data
+        Original tensor used for training, usually `theta`, with shape [N, D].
+
+    parameter_names
+        Names corresponding to the D columns, for example `result.columns`.
+
+    output_path
+        Output PNG path.
+
+    selected_parameters
+        Optional list of parameter names to include. If None, all dimensions
+        are plotted.
+
+    n_model_samples
+        Number of samples drawn from the fitted ML model.
+
+    max_training_samples
+        Maximum number of original training samples shown. Subsampling only
+        affects the plot, not the trained model.
+
+    quantile_range
+        Quantile limits used to determine common plotting ranges. This avoids
+        a few extreme samples distorting every panel.
+
+    Returns
+    -------
+    model_samples : np.ndarray
+        All generated model samples with shape [n_model_samples, D].
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    parameter_names = [str(name) for name in parameter_names]
+
+    training_np = _samples_to_2d_numpy(
+        training_data,
+        name="training_data",
+    )
+
+    if training_np.shape[1] != len(parameter_names):
+        raise ValueError(
+            f"training_data has D={training_np.shape[1]}, but "
+            f"{len(parameter_names)} parameter names were supplied."
+        )
+
+    # Batch-normalization layers must use their fitted running statistics.
+    model.network.eval()
+
+    with torch.no_grad():
+        generated = model.sample(
+            num_samples=n_model_samples,
+        )
+
+    model_np = _samples_to_2d_numpy(
+        generated,
+        name="model samples",
+    )
+
+    if model_np.shape[1] != training_np.shape[1]:
+        raise ValueError(
+            f"Model samples have D={model_np.shape[1]}, while the "
+            f"training data have D={training_np.shape[1]}."
+        )
+
+    # Select columns by parameter name.
+    if selected_parameters is None:
+        selected_indices = np.arange(training_np.shape[1])
+        selected_names = parameter_names
+    else:
+        selected_parameters = [
+            str(name) for name in selected_parameters
+        ]
+
+        missing = [
+            name
+            for name in selected_parameters
+            if name not in parameter_names
+        ]
+
+        if missing:
+            raise KeyError(
+                f"Requested corner-plot parameters were not found: {missing}"
+            )
+
+        selected_indices = np.array(
+            [parameter_names.index(name) for name in selected_parameters],
+            dtype=int,
+        )
+        selected_names = selected_parameters
+
+    if len(selected_names) > 12:
+        print(
+            f"Warning: plotting {len(selected_names)} dimensions creates "
+            f"{len(selected_names) ** 2} corner panels."
+        )
+
+    training_selected = training_np[:, selected_indices]
+    model_selected = model_np[:, selected_indices]
+
+    # Subsample the training cloud to prevent it from dominating the figure.
+    rng = np.random.default_rng(random_seed)
+
+    n_training_plot = min(
+        int(max_training_samples),
+        training_selected.shape[0],
+    )
+
+    if n_training_plot < training_selected.shape[0]:
+        selected_rows = rng.choice(
+            training_selected.shape[0],
+            size=n_training_plot,
+            replace=False,
+        )
+        training_plot = training_selected[selected_rows]
+    else:
+        training_plot = training_selected
+
+    # Use common robust ranges for both data clouds.
+    combined = np.vstack(
+        [training_plot, model_selected]
+    )
+
+    lower_q, upper_q = quantile_range
+
+    if not 0.0 <= lower_q < upper_q <= 1.0:
+        raise ValueError(
+            "quantile_range must satisfy "
+            "0 <= lower < upper <= 1."
+        )
+
+    lower = np.quantile(combined, lower_q, axis=0)
+    upper = np.quantile(combined, upper_q, axis=0)
+
+    span = upper - lower
+
+    # Add a small margin and handle nearly constant parameters.
+    padding = np.where(
+        span > 0,
+        0.05 * span,
+        0.01 * np.maximum(np.abs(lower), 1.0),
+    )
+
+    plotting_ranges = [
+        (float(lo - pad), float(hi + pad))
+        for lo, hi, pad in zip(lower, upper, padding)
+    ]
+
+    # Draw the original training distribution first.
+    fig = corner.corner(
+        training_plot,
+        labels=selected_names,
+        range=plotting_ranges,
+        bins=bins,
+        color="C0",
+        plot_datapoints=False,
+        plot_density=True,
+        plot_contours=True,
+        fill_contours=False,
+        smooth=1.0,
+        smooth1d=1.0,
+        hist_kwargs={
+            "alpha": 0.45,
+        },
+        contour_kwargs={
+            "linewidths": 1.2,
+        },
+        label_kwargs={
+            "fontsize": 9,
+        },
+        show_titles=True,
+        title_fmt=".4g",
+        title_kwargs={
+            "fontsize": 9,
+        },
+    )
+
+    # Overlay samples from the fitted ML model.
+    corner.corner(
+        model_selected,
+        labels=selected_names,
+        range=plotting_ranges,
+        bins=bins,
+        color="C1",
+        fig=fig,
+        plot_datapoints=False,
+        plot_density=True,
+        plot_contours=True,
+        fill_contours=False,
+        smooth=1.0,
+        smooth1d=1.0,
+        hist_kwargs={
+            "alpha": 0.45,
+        },
+        contour_kwargs={
+            "linewidths": 1.2,
+        },
+        show_titles=False,
+    )
+
+    legend_handles = [
+        Line2D(
+            [],
+            [],
+            color="C0",
+            linewidth=2.0,
+            label=f"Training data (n={training_plot.shape[0]})",
+        ),
+        Line2D(
+            [],
+            [],
+            color="C1",
+            linewidth=2.0,
+            label=f"Fitted ML model (n={model_selected.shape[0]})",
+        ),
+    ]
+
+    fig.legend(
+        handles=legend_handles,
+        loc="upper right",
+        bbox_to_anchor=(0.98, 0.98),
+        frameon=True,
+    )
+
+    fig.suptitle(
+        "Training posterior samples versus fitted copula model",
+        y=1.01,
+    )
+
+    fig.savefig(
+        output_path,
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
+
+    print(f"Saved corner plot to: {output_path}")
+    print(f"Training samples plotted: {training_plot.shape[0]}")
+    print(f"Model samples plotted:    {model_selected.shape[0]}")
+    print(f"Parameters plotted:       {selected_names}")
+
+    return model_np
+
+#TODO: add validation + early stopping
+#TODO: corner plot + masses
+def main_hdf5():
+    h5_path = (
+        "/root/phd/GW_seperation_analysis/postProcessing/results_joint_final.hdf5"
+    )
+
+    #build scenario
+    ScenConfig     = ScenarioConfig()
+    scenario,logger,plot_dir,data_dir = setUpLoggerScenario(ScenConfig)
+    data_dir = data_dir/ "results_joint_final.hdf5"
+    results = utils.exctractResults(data_dir,logger)
+    result = utils.join_waveform_posteriors(results)
+    
+    theta = torch.from_numpy(
+        result.to_numpy(dtype=np.float32)
+    )
+    train_loader = DataLoader(
+        theta,
+        batch_size=1000,
+        shuffle=True,
+    )
+    model = CopulaNormalizingFlowModel(
+        metadata=make_copula_ml_metadata(),
+        device='cpu',
+    )
+    parameter_inventory(model)
+    losses = train_copula_ML(model
+                             ,train_loader
+                             ,n_epochs = 200
+                             ,lr = 1e-6
+                             ,start_from_best = True
+                             )
+    
+    diagnostics_dir = Path(plot_dir) / "copula_ml"
+    plot_ml_losses(
+        losses,
+        diagnostics_dir / "training_losses.png",
+        moving_average_window=10,
+        skip_initial_epochs=1,
+
+    )
+
+    print_fitted_copula_model(
+        model,
+        parameter_names=result.columns,
+        output_dir=diagnostics_dir,
+    )
+    
+    preferred_parameters = [
+    "chirp_mass_A",
+    "mass_ratio_A",
+    "chirp_mass_B",
+    "mass_ratio_B",
+    'psi_A', 'phase_A',
+    'psi_B', 'phase_B',
+    'geocent_time_B','geocent_time_A'
+    ]
+
+    # Keep only names that actually occur in the HDF5 result.
+    corner_parameters = [
+        name
+        for name in preferred_parameters
+        if name in result.columns
+    ]
+
+    # Fallback in case these precise variables are not present.
+    if len(corner_parameters) < 2:
+        corner_parameters = list(result.columns[:6])
+
+    generated_samples = plot_ml_training_vs_samples_corner(
+        model=model,
+        training_data=theta,
+        parameter_names=result.columns,
+        selected_parameters=corner_parameters,
+        output_path=diagnostics_dir / "training_vs_ml_corner.png",
+        n_model_samples=5000,
+        max_training_samples=5000,
+        bins=35,
+    )
+    print("end")
+
+if __name__ == "__main__":
+    main_hdf5()
