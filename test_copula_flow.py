@@ -20,7 +20,7 @@ import math
 import torch.nn.functional as F
 from tqdm import trange
 from vector_copula_vi.VectorCopulaFlow_V2  import ZukoVectorCopulaFlow
-
+from vector_copula_vi.EllipticalVectorCopulaFlow import EllipticalVectorCopulaFlow
 class IdentityTransform:
     domain = constraints.real_vector
     codomain = constraints.real_vector
@@ -164,34 +164,40 @@ def optim_args(param_name):
     }
 
 def get_lr_for_param(param_name, step):
-    if param_name == "B":
-        base_lr = 5e-4
-        factor = cosine_cycle(
-            step,
-            cycle_length=500,
-            min_factor=0.05,
-            max_factor=1.0,
-        )
+    # if param_name == "B":
+    #     base_lr = 5e-2
+    #     factor = cosine_cycle(
+    #         step,
+    #         cycle_length=500,
+    #         min_factor=0.05,
+    #         max_factor=1.0,
+    #     )
 
-    elif param_name == "z":
-        base_lr = 5e-4
-        factor = cosine_cycle(
-            step,
-            cycle_length=500,
-            min_factor=0.05,
-            max_factor=1.0,
-        )
+    # elif param_name == "z":
+    #     base_lr = 5e-2
+    #     factor = cosine_cycle(
+    #         step,
+    #         cycle_length=500,
+    #         min_factor=0.05,
+    #         max_factor=1.0,
+    #     )
 
-    else:
-        base_lr = 5e-4
-        factor = shifted_cosine_cycle(
-            step,
-            cycle_length=500,
-            min_factor=0.05,
-            max_factor=1.0,
-        )
+    # else:
+    #     base_lr = 5e-2
+    #     factor = shifted_cosine_cycle(
+    #         step,
+    #         cycle_length=500,
+    #         min_factor=0.05,
+    #         max_factor=1.0,
+    #     )
 
-    return base_lr * factor
+    # return base_lr * factor
+    
+    base_lr = 1e-3
+    gamma = 0.95
+
+    return base_lr #* (gamma ** step)
+
 class pyroImplementation:
     def __init__(self,trainData,knownCov):
         self.priorVar  = 2.0
@@ -218,7 +224,7 @@ class pyroImplementation:
         # )
         
         self.knownCov = knownCov.expand(1,self.D,self.D)
-        self.loss   = Trace_ELBO(num_particles=5) #
+        self.loss     = Trace_ELBO(num_particles=5) #
 
         #optimizer args
         self.optimizer = ClippedAdam(optim_args) 
@@ -461,6 +467,104 @@ def compute_log_prob_diagnostics_from_model(
 
     return diagnostics
 
+def compute_log_prob_diagnostics_from_model_elliptical(
+    model,
+    value=None,
+    n_diag_samples=512,
+    use_samples=False,
+):
+    """
+    Compute diagnostic components of the elliptical vector-copula
+    log probability.
+
+    Decomposition:
+
+        log q(x)
+        = log_copula
+        + log_prob_NF
+
+    with
+
+        log_copula
+        = log_joint
+        - log_marginals
+    """
+
+    with torch.no_grad():
+
+        if use_samples:
+            value = model.sample(
+                (n_diag_samples,)
+            )
+
+        elif value is None:
+            raise ValueError(
+                "value must be provided when use_samples=False"
+            )
+
+        components = model.log_prob(value)
+
+        diagnostics = {
+            "q_total":
+                components[
+                    "log_prob_total"
+                ].mean().detach().cpu().item(),
+
+            "q_NF":
+                components[
+                    "log_prob_NF"
+                ].mean().detach().cpu().item(),
+
+            "q_copula":
+                components[
+                    "log_copula"
+                ].mean().detach().cpu().item(),
+
+            "q_elliptical_joint":
+                components[
+                    "log_joint"
+                ].mean().detach().cpu().item(),
+
+            "q_elliptical_marginals":
+                components[
+                    "log_marginals"
+                ].mean().detach().cpu().item(),
+        }
+
+    return diagnostics
+
+def update_component_history(
+    component_history,
+    components,
+):
+    """
+    Append mean log-probability components to the training history.
+
+    Args:
+        component_history (dict[str, list]):
+            History dictionary storing scalar diagnostics.
+
+        components (dict[str, torch.Tensor]):
+            Output of model.log_prob_components(...).
+    """
+
+    mapping = {
+        "q_total": "log_prob_total",
+        "q_NF": "log_prob_NF",
+        "q_copula": "log_copula",
+        "q_elliptical_joint": "log_joint",
+        "q_elliptical_marginals": "log_marginals",
+    }
+
+    for history_key, component_key in mapping.items():
+        component_history[history_key].append(
+            components[component_key]
+            .mean()
+            .detach()
+            .cpu()
+            .item()
+        )
+
 def count_trainable_params(model):
     flow_params = [
         p
@@ -477,20 +581,25 @@ def count_trainable_params(model):
     return total
 
 def getInitModelParams(TrainIdentity = False):
+    # mixture_scales=(0.75, 1.25)
+    # mixture_weights=(0.5, 0.5)
+    mixture_scales=(0.75, 1.25, 0.5)
+    mixture_weights=(0.3,0.3,0.4)
+    blocksizes = [2, 2]
     flow_1 = zuko.flows.NSF(
-        features=2,
+        features=blocksizes[0],
         transforms=6,
         context=0,
-        hidden_features=(8, 8),
+        hidden_features=(16, 16),
         bins=32,
         randperm=True,
     )
     
     flow_2 = zuko.flows.NSF(
-        features=2,
+        features=blocksizes[1],
         transforms=6,
         context=0,
-        hidden_features=(8, 8),
+        hidden_features=(16, 16),
         bins=32,
         randperm=False,
     )
@@ -499,7 +608,7 @@ def getInitModelParams(TrainIdentity = False):
     if TrainIdentity:
         history = train_flows_to_identity(
             flows=[flow_1, flow_2],
-            steps=5000,
+            steps=500,
             batch_size=4096,
             lr=5e-3,
             device="cpu",
@@ -511,19 +620,64 @@ def getInitModelParams(TrainIdentity = False):
     # flow_1 = IdentityFlow(features=2)
     # flow_2 = IdentityFlow(features=2)
     flow_2.load_state_dict(flow_1.state_dict())  #break symmetry
-    flows = [flow_1,flow_2]
-    B     = torch.nn.Parameter(torch.randn(1, 4, 3) * 0.5)
-    z     = torch.nn.Parameter(torch.tensor([1.0]))
-    return flows,B,z
+    flows = nn.ModuleList([
+        flow_1,
+        flow_2,
+    ])
+
+    D = sum(blocksizes)
+
+    B = torch.nn.Parameter(
+        torch.randn(1, D, 3) * 0.5
+    )
+
+    z = torch.nn.Parameter(
+        torch.tensor([1.0])
+    )
+    scales = torch.as_tensor(
+        mixture_scales,
+        dtype=B.dtype,
+        device=B.device,
+    )
+
+    weights = torch.as_tensor(
+        mixture_weights,
+        dtype=B.dtype,
+        device=B.device,
+    )
+
+    
+    return (
+        flows,
+        B,
+        z,
+        blocksizes,
+        scales,
+        weights,
+    )
 
 def buildModel():
-    flows,B,z = getInitModelParams()
-    model = ZukoVectorCopulaFlow(
-        flows = flows,       
-        B     = B,
-        z     = z
+    (
+        flows,
+        B,
+        z,
+        blocksizes,
+        scales,
+        weights,
+    ) = getInitModelParams(TrainIdentity = False)
+    # model = ZukoVectorCopulaFlow(
+    #     flows = flows,       
+    #     B     = B,
+    #     z     = z
+    # )
+    model = EllipticalVectorCopulaFlow(
+        flows=flows,
+        B=B,
+        z=z,
+        blocksizes=blocksizes,
+        scales=scales,
+        weights=weights,
     )
-    
     print(f"amount of trainable params: {count_trainable_params(model)}")
     return model
 
@@ -773,7 +927,8 @@ def pretrain_marginal_flows(
 
     return history
 
-def train(model_to_train,num_epochs,
+def train(model_to_train,
+        num_epochs,
         X,
         batch_size = 5000, 
         # lr_flows=1e-3,
@@ -811,6 +966,14 @@ def train(model_to_train,num_epochs,
                 "params": [model_to_train.z],
                 "name": "z",
             },
+            {
+                "params": [model_to_train.raw_scale_gaps],
+                "name": "scales",
+            },            
+            {
+                "params": [model_to_train.weight_logits],
+                "name": "weights",
+            },
         ]
     optimizer = torch.optim.Adam(optimizer_args) 
     # optimizer = optim.LBFGS(flow_params + [model_to_train.B, model_to_train.z], lr=1.0,history_size=2000, max_iter=20, line_search_fn="strong_wolfe")
@@ -825,13 +988,22 @@ def train(model_to_train,num_epochs,
     losses = []
     
     #decompose logProbe
+    # component_history = {
+    #     "q_total": [],
+    #     "q_marginal_total": [],
+    #     "q_copula_total": [],
+    #     "q_log_det": [],
+    #     "q_copula_quad": [],
+    # }
+    
     component_history = {
         "q_total": [],
-        "q_marginal_total": [],
-        "q_copula_total": [],
-        "q_log_det": [],
-        "q_copula_quad": [],
+        "q_NF": [],
+        "q_copula": [],
+        "q_elliptical_joint": [],
+        "q_elliptical_marginals": [],
     }
+
     diagnostic_every = 1
     
     for epoch in tqdm(range(num_epochs)):
@@ -845,13 +1017,14 @@ def train(model_to_train,num_epochs,
         # n_seen = 0
 
         # for (X_batch,) in dataloader:
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
-
-        log_prob = model_to_train.log_prob(X)                  # scalar
+        components = model_to_train.log_prob_components(X)
+        log_prob = components[
+            "log_prob_total"
+        ]
+        # scalar
         loss = -log_prob.mean()
-        loss.backward()
-        optimizer.step()
         # def closure():
         #     optimizer.zero_grad()
 
@@ -863,7 +1036,7 @@ def train(model_to_train,num_epochs,
         #     return loss
 
         # loss = optimizer.step(closure)
-        loss_value = loss.detach().cpu().item()
+        # loss_value = loss.detach().cpu().item()
 
             # Store loss for this specific minibatch
             # batch_losses.append(loss_value)
@@ -872,19 +1045,31 @@ def train(model_to_train,num_epochs,
             # n_seen += batch_n
             
         # scheduler.step()
-        mean_epoch_loss = loss_value# epoch_loss / n_seen
-        losses.append(mean_epoch_loss)
         if epoch % diagnostic_every == 0:
-            diagnostics = compute_log_prob_diagnostics_from_model(
-                model=model_to_train,
-                value=X,
-                use_samples=False,
+            update_component_history(
+                component_history,
+                components,
             )
+            # diagnostics = compute_log_prob_diagnostics_from_model_elliptical( #compute_log_prob_diagnostics_from_model(
+            #     model=model_to_train,
+            #     value=X,
+            #     use_samples=False,
+            # )
 
-            for key, value_diag in diagnostics.items():
-                if key not in component_history:
-                    component_history[key] = []
-                component_history[key].append(value_diag)
+            # for key, value_diag in diagnostics.items():
+            #     if key not in component_history:
+            #         component_history[key] = []
+            #     component_history[key].append(value_diag)
+        loss.backward()
+
+        optimizer.step()
+
+        losses.append(
+            loss.detach()
+            .cpu()
+            .item()
+        )
+
     return losses,component_history#, batch_losses, dataloader
 
 def clone_tensor(x):
@@ -961,7 +1146,7 @@ def compare_models_manual(model_a, model_b, name_a="model_a", name_b="model_b", 
             print(diff)
 
 def SampleMLGaussianModel(N):
-    covTrue = 1000*torch.tensor([ 
+    covTrue = 1*torch.tensor([ 
         [1.0, 0.5, 0.1, 0.3],
         [0.5, 1.0, 0.2, 0.05],
         [0.1, 0.2, 1.0, 0.45],
@@ -1089,21 +1274,21 @@ def corner_plot_tensor(
 
     return fig
 
-def plot_losses(epoch_losses,batch_losses,dataloader,suffix = "_1"):
+def plot_losses(epoch_losses,suffix = "_1"):
     # Suppose these are returned by train(...)
     # epoch_losses, batch_losses = train(model, num_epochs, X)
 
-    batches_per_epoch = len(dataloader)
+    # batches_per_epoch = len(dataloader)
 
-    batch_x = np.arange(len(batch_losses))
+    # batch_x = np.arange(len(batch_losses))
 
     # Put each epoch loss at the final minibatch index of that epoch
-    epoch_x = (np.arange(1, len(epoch_losses) + 1) * batches_per_epoch) - 1
+    # epoch_x = (np.arange(1, len(epoch_losses) + 1) * batches_per_epoch) - 1
 
     plt.figure(figsize=(8, 4))
 
-    plt.plot(batch_x, batch_losses, label="Minibatch loss", alpha=0.6, linewidth=0.5)
-    plt.plot(epoch_x, epoch_losses, label="Mean epoch loss", marker="o",ms=1, linewidth=0.5,alpha=0.6)
+    # plt.plot(batch_x, batch_losses, label="Minibatch loss", alpha=0.6, linewidth=0.5)
+    plt.plot(epoch_losses, label="Mean epoch loss", marker="o",ms=1, linewidth=0.5,alpha=0.6)
 
     plt.xlabel("Optimization step / minibatch")
     plt.ylabel("Negative log likelihood")
@@ -1298,6 +1483,73 @@ def plot_q_log_prob_components(component_history, suffix="_pyro"):
     plt.savefig(filename, dpi=300, bbox_inches="tight")
     plt.close()
 
+def plot_q_log_prob_components_ellips(
+    component_history,
+    suffix="_elliptical",
+):
+    plt.figure(figsize=(10, 5))
+
+    plt.plot(
+        component_history["q_total"],
+        label="Total log probability",
+        linewidth=1.2,
+        linestyle="dashed",
+    )
+
+    plt.plot(
+        component_history["q_NF"],
+        label="NF marginal contribution",
+        linewidth=1.0,
+        alpha=0.8,
+        linestyle="dashdot",
+    )
+
+    plt.plot(
+        component_history["q_copula"],
+        label="Elliptical copula contribution",
+        linewidth=1.0,
+        alpha=0.8,
+        linestyle="dotted",
+    )
+
+    plt.plot(
+        component_history["q_elliptical_joint"],
+        label="Elliptical joint log density",
+        linewidth=1.0,
+        alpha=0.8,
+    )
+
+    plt.plot(
+        component_history["q_elliptical_marginals"],
+        label="Sum elliptical marginal log densities",
+        linewidth=1.0,
+        alpha=0.8,
+    )
+
+    plt.xlabel("Optimization step")
+    plt.ylabel("Mean log-probability contribution")
+    plt.title(
+        "Elliptical vector-copula log-probability components"
+    )
+
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    filename = (
+        "vector_copula_vi_v2/"
+        "vector_copula_vi/"
+        "Plots/"
+        f"q_log_prob_components{suffix}.png"
+    )
+
+    plt.savefig(
+        filename,
+        dpi=300,
+        bbox_inches="tight",
+    )
+
+    plt.close()
+
 def plot_each_marginal_flow_output(
     q,
     N=10_000,
@@ -1428,7 +1680,561 @@ def copula_weight_schedule(step, warmup_steps=1000, max_weight=5.0):
 
     return max_weight * (1.0 - t) + 1.0 * t
 
+def build_identity_elliptical_model(seed=1234):
+    """
+    Elliptical vector copula with:
+        - exact identity marginal flows
+        - randomly initialized copula
+        - one Gaussian scale component: scale=1, weight=1
 
+    This isolates the sampling implementation.
+    """
+    torch.manual_seed(seed)
+
+    blocksizes = [2, 2]
+    D = sum(blocksizes)
+
+    flows = nn.ModuleList([
+        IdentityFlow(features=2),
+        IdentityFlow(features=2),
+    ])
+
+    # Random copula parameters
+    B = nn.Parameter(
+        torch.randn(1, D, 3) * 0.5
+    )
+
+    z = nn.Parameter(
+        torch.tensor([1.0])
+    )
+
+    # Pure Gaussian elliptical distribution
+    scales = torch.tensor(
+        [1.0],
+        dtype=B.dtype,
+        device=B.device,
+    )
+
+    weights = torch.tensor(
+        [1.0],
+        dtype=B.dtype,
+        device=B.device,
+    )
+
+    model = EllipticalVectorCopulaFlow(
+        flows=flows,
+        B=B,
+        z=z,
+        blocksizes=blocksizes,
+        scales=scales,
+        weights=weights,
+    )
+
+    return model
+
+@torch.no_grad()
+def test_identity_elliptical_sampler(
+    n_samples=20_000,
+    seed=1234,
+):
+    torch.manual_seed(seed)
+
+    model = build_identity_elliptical_model(
+        seed=seed
+    )
+
+    model._refresh_elliptical_state()
+
+    print("\n======================================")
+    print("IDENTITY ELLIPTICAL SAMPLING TEST")
+    print("======================================")
+
+    print("\nOmega:")
+    print(model.Omega_matrix[0])
+
+    # -----------------------------------
+    # Draw samples through model.sample()
+    # -----------------------------------
+    X = model.sample((n_samples,))
+    # [N, M=1, D]
+
+    print("\nX shape:", X.shape)
+
+    x = X[:, 0, :]  # [N, D]
+
+    # -----------------------------------
+    # Empirical moments
+    # -----------------------------------
+    empirical_mean = x.mean(dim=0)
+
+    xc = x - empirical_mean
+
+    empirical_cov = (
+        xc.T @ xc
+    ) / (n_samples - 1)
+
+    # -----------------------------------
+    # Expected covariance after the
+    # blockwise inverse elliptical map
+    # -----------------------------------
+
+    L_inv_blocks = []
+
+    for L_inv in model.L_omega_inv_blocks:
+
+        # Usually [M, d_i, d_i]
+        if L_inv.ndim == 3:
+            L_inv = L_inv[0]
+
+        L_inv_blocks.append(L_inv)
+
+    W = torch.block_diag(
+        *L_inv_blocks
+    )
+
+    Omega = model.Omega_matrix[0]
+
+    expected_cov = (
+        W
+        @ Omega
+        @ W.T
+    )
+
+    print("\nEmpirical mean:")
+    print(empirical_mean)
+
+    print("\nExpected mean:")
+    print(torch.zeros_like(empirical_mean))
+
+    print("\nEmpirical covariance:")
+    print(empirical_cov)
+
+    print("\nExpected covariance:")
+    print(expected_cov)
+
+    print("\nCovariance difference:")
+    print(empirical_cov - expected_cov)
+
+    print(
+        "\nmax |cov error|:",
+        (empirical_cov - expected_cov)
+        .abs()
+        .max()
+        .item()
+    )
+
+    print(
+        "Frobenius cov error:",
+        torch.linalg.norm(
+            empirical_cov - expected_cov
+        ).item()
+    )
+
+    # -----------------------------------
+    # Check each marginal block
+    # -----------------------------------
+
+    X_blocks = torch.split(
+        x,
+        model.blocksizes,
+        dim=-1,
+    )
+
+    for i, x_i in enumerate(X_blocks):
+
+        mean_i = x_i.mean(dim=0)
+
+        xc_i = x_i - mean_i
+
+        cov_i = (
+            xc_i.T @ xc_i
+        ) / (n_samples - 1)
+
+        print(f"\nBlock {i}")
+        print("mean:")
+        print(mean_i)
+
+        print("covariance:")
+        print(cov_i)
+
+        print(
+            "mean squared radius:",
+            x_i.square()
+            .sum(dim=-1)
+            .mean()
+            .item()
+        )
+
+    # -----------------------------------
+    # Gaussian reference with the exact
+    # expected covariance
+    # -----------------------------------
+
+    reference_dist = torch.distributions.MultivariateNormal(
+        loc=torch.zeros(
+            model.D,
+            dtype=x.dtype,
+            device=x.device,
+        ),
+        covariance_matrix=expected_cov,
+    )
+
+    X_reference = reference_dist.sample(
+        (n_samples,)
+    )
+
+    return (
+        model,
+        X,
+        X_reference.unsqueeze(1),
+        empirical_cov,
+        expected_cov,
+    )
+
+@torch.no_grad()
+def test_identity_elliptical_log_prob(
+    model,
+    n_samples=10_000,
+):
+    """
+    Test EllipticalVectorCopulaFlow.log_prob against the exact Gaussian
+    density in the J=1, scale=1, identity-flow case.
+
+    Assumes:
+        - IdentityFlow marginals
+        - one mixture component
+        - scale = 1
+    """
+
+    model._refresh_elliptical_state()
+
+    print("\n======================================")
+    print("IDENTITY ELLIPTICAL LOG-PROB TEST")
+    print("======================================")
+
+    # --------------------------------------------------
+    # Construct the exact covariance of X.
+    #
+    # Y ~ N(0, Omega)
+    # X_i = L_i^{-1} Y_i
+    #
+    # Therefore:
+    #
+    # Cov(X) = W Omega W^T
+    #
+    # where W = blockdiag(L_1^{-1}, ..., L_K^{-1})
+    # --------------------------------------------------
+
+    L_inv_blocks = []
+
+    for L_inv in model.L_omega_inv_blocks:
+
+        # [M, d_i, d_i] -> [d_i, d_i]
+        if L_inv.ndim == 3:
+            L_inv = L_inv[0]
+
+        L_inv_blocks.append(L_inv)
+
+    W = torch.block_diag(*L_inv_blocks)
+
+    Omega = model.Omega_matrix[0]
+
+    expected_cov = (
+        W
+        @ Omega
+        @ W.T
+    )
+
+    print("\nOmega:")
+    print(Omega)
+
+    print("\nExpected covariance of X:")
+    print(expected_cov)
+
+    # --------------------------------------------------
+    # Exact reference distribution
+    # --------------------------------------------------
+
+    exact_dist = torch.distributions.MultivariateNormal(
+        loc=torch.zeros(
+            model.D,
+            device=Omega.device,
+            dtype=Omega.dtype,
+        ),
+        covariance_matrix=expected_cov,
+    )
+
+    # --------------------------------------------------
+    # TEST 1:
+    # evaluate on samples generated by our own model
+    # --------------------------------------------------
+
+    X = model.sample((n_samples,))
+    # [N, M=1, D]
+
+    log_q = model.log_prob(X)
+    # [N, 1]
+
+    log_ref = exact_dist.log_prob(
+        X[:, 0, :]
+    )
+    # [N]
+
+    log_q = log_q[:, 0]
+
+    error = log_q - log_ref
+
+    print("\n--- model-generated points ---")
+
+    print(
+        "mean |logq - logref|:",
+        error.abs().mean().item(),
+    )
+
+    print(
+        "max  |logq - logref|:",
+        error.abs().max().item(),
+    )
+
+    print(
+        "RMSE:",
+        torch.sqrt(
+            error.square().mean()
+        ).item(),
+    )
+
+    print(
+        "mean signed error:",
+        error.mean().item(),
+    )
+
+    # --------------------------------------------------
+    # TEST 2:
+    # arbitrary points, independent of model.sample()
+    #
+    # This is important because otherwise sampling and
+    # density bugs could in principle cancel.
+    # --------------------------------------------------
+
+    X_random = torch.randn(
+        n_samples,
+        1,
+        model.D,
+        device=Omega.device,
+        dtype=Omega.dtype,
+    )
+
+    log_q_random = model.log_prob(
+        X_random
+    )[:, 0]
+
+    log_ref_random = exact_dist.log_prob(
+        X_random[:, 0, :]
+    )
+
+    error_random = (
+        log_q_random
+        - log_ref_random
+    )
+
+    print("\n--- independent random points ---")
+
+    print(
+        "mean |logq - logref|:",
+        error_random.abs().mean().item(),
+    )
+
+    print(
+        "max  |logq - logref|:",
+        error_random.abs().max().item(),
+    )
+
+    print(
+        "RMSE:",
+        torch.sqrt(
+            error_random.square().mean()
+        ).item(),
+    )
+
+    print(
+        "mean signed error:",
+        error_random.mean().item(),
+    )
+
+    # --------------------------------------------------
+    # TEST 3:
+    # decomposition
+    # --------------------------------------------------
+
+    components = model.log_prob_components(
+        X_random
+    )
+
+    log_nf = components[
+        "log_prob_NF"
+    ][:, 0]
+
+    log_copula = components[
+        "log_copula"
+    ][:, 0]
+
+    # Exact standard-Normal marginal contribution
+    standard_normal = torch.distributions.Normal(
+        torch.tensor(
+            0.0,
+            device=Omega.device,
+            dtype=Omega.dtype,
+        ),
+        torch.tensor(
+            1.0,
+            device=Omega.device,
+            dtype=Omega.dtype,
+        ),
+    )
+
+    exact_log_nf = (
+        standard_normal
+        .log_prob(X_random[:, 0, :])
+        .sum(dim=-1)
+    )
+
+    exact_log_copula = (
+        log_ref_random
+        - exact_log_nf
+    )
+
+    nf_error = log_nf - exact_log_nf
+    copula_error = (
+        log_copula
+        - exact_log_copula
+    )
+
+    print("\n--- decomposition ---")
+
+    print(
+        "NF mean abs error:",
+        nf_error.abs().mean().item(),
+    )
+
+    print(
+        "NF max abs error:",
+        nf_error.abs().max().item(),
+    )
+
+    print(
+        "copula mean abs error:",
+        copula_error.abs().mean().item(),
+    )
+
+    print(
+        "copula max abs error:",
+        copula_error.abs().max().item(),
+    )
+
+    return {
+        "X": X,
+        "expected_cov": expected_cov,
+        "log_q": log_q,
+        "log_ref": log_ref,
+        "error": error,
+        "random_error": error_random,
+        "nf_error": nf_error,
+        "copula_error": copula_error,
+    }
+
+def test_radial_gradient(model, m=2, n=1000):
+
+    rho = torch.rand(
+        n, 1,
+        device=model.B.device,
+        dtype=model.B.dtype,
+        requires_grad=True,
+    ) * 4.0 + 0.05
+
+    chi2 = torch.distributions.Chi2(
+        torch.as_tensor(
+            float(m),
+            device=rho.device,
+            dtype=rho.dtype,
+        )
+    )
+
+    p = chi2.cdf(rho.square())
+
+    r, _ = model._invert_monotone_cdf(
+        p=p,
+        cdf_fn=lambda x: model.radial_cdf(x, m),
+        pdf_fn=lambda x: model.radial_pdf(x, m),
+        initial_hi=model.scales.max(),
+        return_diagnostics=False,
+    )
+
+    grad = torch.autograd.grad(
+        r.sum(),
+        rho,
+    )[0]
+
+    print("mean |r-rho|:",
+          (r-rho).abs().mean().item())
+
+    print("max  |r-rho|:",
+          (r-rho).abs().max().item())
+
+    print("mean dr/drho:",
+          grad.mean().item())
+
+    print("mean |dr/drho - 1|:",
+          (grad-1).abs().mean().item())
+
+    print("max  |dr/drho - 1|:",
+          (grad-1).abs().max().item())
+
+
+@torch.no_grad()
+def compare_gaussian_fit(model, X_target, n=100_000):
+
+    X_model = model.sample((n,))[:, 0, :]
+    X_target = X_target.reshape(-1, X_target.shape[-1])
+
+    mean_model = X_model.mean(0)
+    mean_target = X_target.mean(0)
+
+    Xm = X_model - mean_model
+    Xt = X_target - mean_target
+
+    cov_model = Xm.T @ Xm / (X_model.shape[0] - 1)
+    cov_target = Xt.T @ Xt / (X_target.shape[0] - 1)
+
+    print("\nmean target:")
+    print(mean_target)
+
+    print("\nmean model:")
+    print(mean_model)
+
+    print("\nmean error:")
+    print(mean_model - mean_target)
+
+    print("\ncov target:")
+    print(cov_target)
+
+    print("\ncov model:")
+    print(cov_model)
+
+    print("\ncov difference:")
+    print(cov_model - cov_target)
+
+    print(
+        "\nmax |cov error|:",
+        (cov_model - cov_target).abs().max().item()
+    )
+
+    print(
+        "Frobenius cov error:",
+        torch.linalg.norm(
+            cov_model - cov_target
+        ).item()
+    )
+    
 #genral functions
 def trainMLTruth(n_epochs):
     suffix                           = "_pyro_v7_ML"
@@ -1445,7 +2251,7 @@ def trainMLTruth(n_epochs):
     # corner_plot_tensor(X,"_pyro_V6_ML_X")
     losses,_ = train(model_to_train,n_epochs,X,batch_size=N_samples,lr = 1e-3)
     
-    # plot_losses(losses, batch_losses, dataloader,suffix = suffix)
+    plot_losses(losses,suffix = suffix)
     plotLossesPyro(losses,suffix)
 
     trainedSample = model_to_train.rsample([N_samples_plot])
@@ -1453,8 +2259,41 @@ def trainMLTruth(n_epochs):
     return impl,model_to_train,PyroData
 
 if __name__ == "__main__":
-    suffix = "__PYRO_V10"
-    n_epochs                 = 500  #10000
+    
+    ### Sampling test ###
+    
+    # (
+    #     model_test,
+    #     X_model,
+    #     X_reference,
+    #     empirical_cov,
+    #     expected_cov,
+    # ) = test_identity_elliptical_sampler(
+    #     n_samples=2_000_000,
+    #     seed=1234,
+    # )
+
+    # make_corner_plot_two_clouds(
+    #     X_model,
+    #     X_reference,
+    #     suffix="__ELLIPTICAL_SAMPLING_TEST",
+    # )
+    
+    # model = build_identity_elliptical_model(
+    #     seed=1234
+    # )
+
+    # results = test_identity_elliptical_log_prob(
+    #     model,
+    #     n_samples=10_000,
+    # )
+    
+    # test_radial_gradient(model, m=2, n=1000)
+    
+    print("Test done done")
+    
+    suffix = "___Ellips_ML_ellips_2"
+    n_epochs                 = 1000  #10000
     # #pyro
     # impl,init_model,PyroData = trainMLTruth(10000)    
     # statePath                = "/root/phd/GW_seperation_analysis/vector_copula_vi_v2/vector_copula_vi/Data/vector_copula_flow_warm_start.pt"
@@ -1463,15 +2302,15 @@ if __name__ == "__main__":
     # print("stop")
     
     ## ML
-    N                    = [2000]
-    # model_base           = buildModel()
+    N                    = [5000]
+    model_base           = buildModel() #buildModel() build_identity_elliptical_model()
     # X                    = model_base.sample(N)
     
     ## pyro
     X,covTrue,_          = SampleMLGaussianModel(N)
     X_base               = X.unsqueeze(1)
-    PyroData             = X_base
-    model_to_train       = buildModel()
+    # PyroData             = X_base
+    # model_to_train       = buildModel()
     # suffix = "temp_ML_fix"
     # state = torch.load(
     # statePath,
@@ -1482,44 +2321,45 @@ if __name__ == "__main__":
     N_samples_plot       = 10000
     
     #classic ML
-    # history_marginals = pretrain_marginal_flows(
-    #     flows=model_to_train.flows,
-    #     X=X,
-    #     block_sizes=[2, 2],
-    #     n_epochs=50,
-    #     batch_size=512,
-    #     lr=1e-3,
-    #     clip_norm=10.0,
-    # )   
-    # plot_marginal_pretraining_history(history_marginals,suffix)
-    # losses,component_history = train(model_to_train,
-    #                                 n_epochs,
-    #                                 X,
-    #                                 # lr_flows=2e-3,
-    #                                 # lr_B=1e-4,
-    #                                 # lr_z=1e-4
-    #     )
-    # plotLossesPyro(losses,suffix)
-    # plot_q_log_prob_components(component_history,suffix)
-    # # plot_losses(losses, batch_losses, dataloader, suffix = suffix)
-    # make_corner_plot_two_clouds(model_to_train.sample([N_samples_plot]),X_base,suffix = suffix)
+    history_marginals = pretrain_marginal_flows(
+        flows=model_base.flows,
+        X=X_base,
+        block_sizes=[2, 2],
+        n_epochs=50,
+        batch_size=512,
+        lr=1e-3,
+        clip_norm=10.0,
+    )   
+    plot_marginal_pretraining_history(history_marginals,suffix)
+    losses,component_history = train(model_base,
+                                    n_epochs,
+                                    X_base,
+                                    # lr_flows=2e-3,
+                                    # lr_B=1e-4,
+                                    # lr_z=1e-4
+        )
+    plotLossesPyro(losses,suffix)
+    plot_q_log_prob_components_ellips(component_history,suffix)
+    # plot_losses(losses, batch_losses, dataloader, suffix = suffix)
+    make_corner_plot_two_clouds(model_base.sample([N_samples_plot]),X_base,suffix = suffix)
+    compare_gaussian_fit(model_base, X_base, n=100_000)
 
 
     #Bayesian
-    impl = pyroImplementation(PyroData,covTrue)
+    # impl = pyroImplementation(PyroData,covTrue)
     
-    losses, component_history = impl.train(n_epochs)
+    # losses, component_history = impl.train(n_epochs)
     
-    Trained_model = impl.get_trained_variational_model()
-    Sample,cov_base,mean_base = impl.samplePosteriorTarget([N_samples_plot])
+    # Trained_model = impl.get_trained_variational_model()
+    # Sample,cov_base,mean_base = impl.samplePosteriorTarget([N_samples_plot])
     
-    make_corner_plot_two_clouds(Trained_model.sample([N_samples_plot]),Sample,suffix = suffix)
-    plot_q_log_prob_components(component_history, suffix=suffix)
-    movingAverageLosses(losses,suffix)
-    _, mean_train, cov_train,  = empirical_covariance(Trained_model, n_samples=N_samples_plot)
-    print(f'cov_base: {cov_base}')
-    print(f'cov_train: {cov_train}')
-    print(f'mean_base: {mean_base}')
-    print(f'mean_train: {mean_train}')
+    # make_corner_plot_two_clouds(Trained_model.sample([N_samples_plot]),Sample,suffix = suffix)
+    # plot_q_log_prob_components(component_history, suffix=suffix)
+    # movingAverageLosses(losses,suffix)
+    # _, mean_train, cov_train,  = empirical_covariance(Trained_model, n_samples=N_samples_plot)
+    # print(f'cov_base: {cov_base}')
+    # print(f'cov_train: {cov_train}')
+    # print(f'mean_base: {mean_base}')
+    # print(f'mean_train: {mean_train}')
 
-    print(f'F-Norm: {torch.norm(cov_base-cov_train)}')
+    # print(f'F-Norm: {torch.norm(cov_base-cov_train)}')
