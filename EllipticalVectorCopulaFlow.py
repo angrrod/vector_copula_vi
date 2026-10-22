@@ -5,8 +5,7 @@ import torch.distributions as D
 from .factor_pattern_copula import FactorPatternCorrelationModel
 
 class EllipticalVectorCopulaFlow(FactorPatternCorrelationModel):
-    #TODO: add context
-    def __init__(self,B:torch.tensor,z:torch.tensor, flows:nn.ModuleList,blocksizes:list,scales:torch.tensor,weights:torch.tensor,is_independent:bool = False,debug_checks:bool = False):
+    def __init__(self,B:torch.tensor,z:torch.tensor, flows:nn.ModuleList,blocksizes:list,raw_scale_gaps:torch.tensor,weight_logits:torch.tensor,is_independent:bool = False,debug_checks:bool = False,context = None, learn_mixture_params:bool=True):
         """_summary_
 
         Args:
@@ -19,6 +18,8 @@ class EllipticalVectorCopulaFlow(FactorPatternCorrelationModel):
             weights (torch.tensor): weight tensor for the different tensors
             is_independent (bool): not implemented
             debug_checks (bool): indicating wether debug checks should be done on the input
+            context (torch.tensor) : context for conditional model used in SBI
+            learn_mixture_params (boolean) : indicator if mixture parameters are constraint in this object or not
         """
         
         ### B               M x D x P matrix, where P < D, D is event_shape and M is the batch shape denoting different distributions, used in amortization        
@@ -31,48 +32,61 @@ class EllipticalVectorCopulaFlow(FactorPatternCorrelationModel):
             debug_checks=debug_checks
         )
         #force them on the simplex -> sum will be one
-        if torch.any(weights <= 0):
+        self.context = context
+        
+        self.learn_mixture_params = learn_mixture_params
+        if weight_logits.shape[-1] != raw_scale_gaps.shape[-1] + 1:
             raise ValueError(
-                f"scales must be strictly positive, got {weights}"
+                "Expected J mixture logits and J-1 raw scale gaps."
             )
-        self.weight_logits = torch.nn.Parameter(
-            torch.log(weights)
-        )  #[J] 
-        #force the scales to be positive
-        if torch.any(scales <= 0):
-            raise ValueError(
-                f"scales must be strictly positive, got {scales}"
-            )
-        self.raw_scale_gaps = nn.Parameter(
-            torch.zeros(weights.shape[0] - 1) #also forces the shapes to be the same
-        ) #[J-1]
+            
+        if learn_mixture_params:
+            self.weight_logits = nn.Parameter(
+                weight_logits.detach().clone()
+            ) #[M, J] 
+
+            self.raw_scale_gaps = nn.Parameter( #new param is being created
+                raw_scale_gaps.detach().clone() #also forces the shapes to be the same
+            ) #[M, J-1]
+        else:
+            # Amortized: retain gradients through parameter_net.
+            # Expected shape: [M, J].
+            self._weight_logits = weight_logits
+            self._raw_scale_gaps = raw_scale_gaps
+            
+        self._refresh_marginals()
         self._refresh_elliptical_state()
-    
     
     @property
     def weights(self):
-        return torch.softmax(
-            self.weight_logits,
-            dim=-1,
-        )
+        if self.learn_mixture_params:
+            logits = self.weight_logits
+        else:
+            logits = self._weight_logits
+
+        return torch.softmax(logits, dim=-1)
     
     @property
     def log_scales(self):
-        gaps = torch.nn.functional.softplus(
-            self.raw_scale_gaps
+        if self.learn_mixture_params:
+            raw = self.raw_scale_gaps 
+        else:
+            raw = self._raw_scale_gaps
+
+        gaps = torch.nn.functional.softplus(raw)
+
+        zero = raw.new_zeros(
+            raw.shape[:-1] + (1,)
         )
 
-        # Fix overall scale: log(sigma_1) = 0
-        # break symmetry
-        return torch.cat([
-            torch.zeros(
-                1,
-                device=gaps.device,
-                dtype=gaps.dtype,
-            ),
-            torch.cumsum(gaps, dim=0),
-        ])
-        
+        return torch.cat(
+            [
+                zero,
+                torch.cumsum(gaps, dim=-1),
+            ],
+            dim=-1,
+        )
+
     @property
     def scales(self):
         return torch.exp(self.log_scales)
@@ -84,10 +98,12 @@ class EllipticalVectorCopulaFlow(FactorPatternCorrelationModel):
         Returns:
             torch.distributions: vector copula model basis
         """
-        J = self.weights.shape[0]
+        weights, scales = self._batched_mixture_parameters()
+
+        J = weights.shape[-1]
 
         covariance_matrix = (
-            self.scales[None, :, None, None].square()
+            scales[..., None, None].square()
             * self.Omega_matrix[:, None, :, :]
         )
 
@@ -106,7 +122,7 @@ class EllipticalVectorCopulaFlow(FactorPatternCorrelationModel):
         )
 
         mixture = torch.distributions.Categorical(
-            probs=self.weights.expand(self.M, -1)
+            probs=weights.expand(self.M, -1)
         )
 
         return torch.distributions.MixtureSameFamily(
@@ -215,7 +231,7 @@ class EllipticalVectorCopulaFlow(FactorPatternCorrelationModel):
             )
         
         chi2          = torch.distributions.Chi2(df=torch.tensor(float(m)))
-        z             = self.flows[i]().transform(value)  #transform.inv
+        z             = self.marginals[i].transform(value)  #transform.inv
         # Gaussian radius
         rho           = torch.linalg.vector_norm(z,dim=-1)
         p             = chi2.cdf(rho.square())
@@ -230,7 +246,7 @@ class EllipticalVectorCopulaFlow(FactorPatternCorrelationModel):
         direction     = torch.matmul(L_i, direction.unsqueeze(-1),).squeeze(-1)
         return r[..., None] * direction
     
-    def _invert_monotone_cdf(self,p,cdf_fn,pdf_fn,initial_hi,n_steps=30,bracket_steps=80,eps=1e-8,return_diagnostics=True):
+    def _invert_monotone_cdf(self,p,cdf_fn,pdf_fn,initial_hi,n_steps=30,bracket_steps=30,eps=1e-8,return_diagnostics=True):
         """
         Numerically invert a monotonically increasing CDF.
 
@@ -395,6 +411,32 @@ class EllipticalVectorCopulaFlow(FactorPatternCorrelationModel):
         )
         self._create_omega_cholesky_blocks()
     
+    def _refresh_marginals(self):
+        self.marginals = [
+            flow(self.context)
+            if self.context is not None else flow()
+            for flow in self.flows
+        ]
+    
+    def _batched_mixture_parameters(self):
+        #dynamically enforce batching in variables
+        weights = self.weights
+        scales = self.scales
+
+        if weights.ndim == 1:
+            weights = weights.unsqueeze(0).expand(self.M, -1)
+
+        if scales.ndim == 1:
+            scales = scales.unsqueeze(0).expand(self.M, -1)
+
+        if weights.shape != scales.shape:
+            raise ValueError("Mixture shape mismatch")
+
+        if weights.shape[0] != self.M:
+            raise ValueError("Context batch size mismatch")
+
+        return weights, scales
+        
     def radial_cdf(self,value,m):
         """radial cdf of the elliptical distribution we use the chi-squared distribution but the actual formula uses a chi distribution
 
@@ -460,19 +502,21 @@ class EllipticalVectorCopulaFlow(FactorPatternCorrelationModel):
         Returns:
             torch.tensor: log pdf
         """
+        weights, scales = self._batched_mixture_parameters()
         idx = self.block_slice(i)
         Omega_i = self.Omega_matrix[..., idx, idx]
 
         # [J, d, d]
         cov = (
-            self.scales[:, None, None].square()
+            scales[:, None, None].square()
             * Omega_i[None, :, :]
         )
         
         # total log probs
+        
         mvn = torch.distributions.MultivariateNormal(
             loc=torch.zeros(
-                self.weights.shape[0], 
+                weights.shape[-1], 
                 value.shape[-1],
                 device=value.device,
                 dtype=value.dtype,
@@ -492,7 +536,7 @@ class EllipticalVectorCopulaFlow(FactorPatternCorrelationModel):
         #add weights for the correct log exp's
         # sum over batches -> sum over mixture components
         return torch.logsumexp(
-            torch.log(self.weights) + component_log_probs,
+            torch.log(weights) + component_log_probs,
             dim=-1,
         )
     
@@ -551,7 +595,7 @@ class EllipticalVectorCopulaFlow(FactorPatternCorrelationModel):
         )
 
         log_probs = [
-            self.flows[i]().log_prob(value_i)
+            self.marginals[i].log_prob(value_i)
             for i, value_i in enumerate(value_blocks)
         ]
 
@@ -562,7 +606,10 @@ class EllipticalVectorCopulaFlow(FactorPatternCorrelationModel):
         ).sum(dim=-1)
     
     def log_prob_components(self, value: torch.Tensor) -> torch.Tensor:
-        self._refresh_elliptical_state()
+        if self.learn_mixture_params:
+            self._refresh_elliptical_state()
+            self._refresh_marginals()
+            
         components = self.log_prob_elliptical(value) 
         components['log_prob_NF'] = self.log_prob_NF(value)
         components['log_prob_total'] = components["log_copula"] + components['log_prob_NF']
@@ -577,7 +624,11 @@ class EllipticalVectorCopulaFlow(FactorPatternCorrelationModel):
             return self.rsample(sample_shape)#[sample_shape, self.M, self.D]
     
     def rsample(self, sample_shape=torch.Size()):
-        self._refresh_elliptical_state()
+        if self.learn_mixture_params:
+            self._refresh_elliptical_state()
+            self._refresh_marginals()
+            
+        
         Y = self.basis_elliptical_distribution.sample(sample_shape)
         # Split full elliptical sample into marginal blocks
         Y_blocks = torch.split(
@@ -597,7 +648,7 @@ class EllipticalVectorCopulaFlow(FactorPatternCorrelationModel):
             )
             
             # Standard Gaussian latent -> NF marginal
-            x_i = self.flows[i]().transform.inv(z_i)  #transform
+            x_i = self.marginals[i].transform.inv(z_i)  #transform
 
             samples.append(x_i)
 
